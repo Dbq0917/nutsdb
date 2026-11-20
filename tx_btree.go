@@ -61,6 +61,13 @@ func (tx *Tx) PutIfNotExists(bucket string, key, value []byte, ttl uint32) error
 		return nil
 	}
 
+	if entry, found := tx.lookupIndexOverlay(bucketId, key); found {
+		if tx.indexOverlayEntryVisible(entry) {
+			return nil
+		}
+		return tx.put(bucket, key, value, ttl, DataSetFlag, uint64(tx.db.ttlService.NowMillis()), DataStructureBTree)
+	}
+
 	idx, bucketExists := tx.db.Index.BTree.exist(bucketId)
 	if !bucketExists {
 		return tx.put(bucket, key, value, ttl, DataSetFlag, uint64(tx.db.ttlService.NowMillis()), DataStructureBTree)
@@ -104,6 +111,13 @@ func (tx *Tx) get(bucket string, key []byte) (value []byte, err error) {
 	case EntryDeleted:
 		return nil, ErrKeyNotFound
 	case EntryUpdated:
+		return entry.Value, nil
+	}
+
+	if entry, found := tx.lookupIndexOverlay(bucketId, key); found {
+		if !tx.indexOverlayEntryVisible(entry) {
+			return nil, ErrKeyNotFound
+		}
 		return entry.Value, nil
 	}
 
@@ -276,6 +290,10 @@ func (tx *Tx) Has(bucket string, key []byte) (exists bool, err error) {
 		return true, nil
 	}
 
+	if entry, found := tx.lookupIndexOverlay(bucketId, key); found {
+		return tx.indexOverlayEntryVisible(entry), nil
+	}
+
 	idx, bucketExists := tx.db.Index.BTree.exist(bucketId)
 	if !bucketExists {
 		return false, ErrBucketNotExist
@@ -430,6 +448,13 @@ func (tx *Tx) Delete(bucket string, key []byte) error {
 		return tx.put(bucket, key, nil, Persistent, DataDeleteFlag, uint64(tx.db.ttlService.NowMillis()), DataStructureBTree)
 	}
 
+	if entry, overlayFound := tx.lookupIndexOverlay(bucketId, key); overlayFound {
+		if tx.indexOverlayEntryVisible(entry) {
+			return tx.put(bucket, key, nil, Persistent, DataDeleteFlag, uint64(tx.db.ttlService.NowMillis()), DataStructureBTree)
+		}
+		return ErrKeyNotFound
+	}
+
 	if idx, ok := tx.db.Index.BTree.exist(bucketId); ok {
 		if _, found := idx.Find(key); !found {
 			return ErrKeyNotFound
@@ -499,6 +524,15 @@ func (tx *Tx) tryGet(bucket string, key []byte, solveRecord func(record *core.Re
 	)
 	entry, err := tx.pendingWrites.Get(DataStructureBTree, bucket, key)
 	found = err == nil
+	if !found {
+		if overlayEntry, overlayFound := tx.lookupIndexOverlay(bucketId, key); overlayFound {
+			if tx.indexOverlayEntryVisible(overlayEntry) {
+				entry = overlayEntry
+				found = true
+			}
+			return solveRecord(nil, entry, found, bucketId)
+		}
+	}
 	if idx, ok := tx.db.Index.BTree.exist(bucketId); ok {
 		record, ok = idx.Find(key)
 		if ok {
@@ -655,6 +689,16 @@ func (tx *Tx) GetTTL(bucket string, key []byte) (int64, error) {
 	// Check pending writes first
 	if pendingTTL, err := tx.pendingWrites.GetTTL(DataStructureBTree, bucket, key); err == nil {
 		return pendingTTL, nil
+	}
+
+	if entry, found := tx.lookupIndexOverlay(bucketId, key); found {
+		if !tx.indexOverlayEntryVisible(entry) {
+			return 0, ErrKeyNotFound
+		}
+		if entry.Meta.TTL == Persistent {
+			return -1, nil
+		}
+		return int64(expireTime(entry.Meta.Timestamp, entry.Meta.TTL).Seconds()), nil
 	}
 
 	idx, bucketExists := tx.db.Index.BTree.exist(bucketId)

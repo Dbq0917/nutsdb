@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/nutsdb/nutsdb/internal/testutils"
 	"github.com/stretchr/testify/require"
 	"github.com/xujiajun/utils/time2"
 )
@@ -143,6 +144,75 @@ func TestBatchWrite(t *testing.T) {
 	}
 	for _, db := range dbs {
 		require.NoError(t, db.Close())
+	}
+}
+
+func TestWriteBatch_ReadImmediatelyAfterAutoCommit(t *testing.T) {
+	modes := []EntryIdxMode{
+		HintKeyValAndRAMIdxMode,
+		HintKeyAndRAMIdxMode,
+	}
+
+	for _, mode := range modes {
+		t.Run(fmt.Sprintf("idx_mode_%d", mode), func(t *testing.T) {
+			db, err := Open(
+				DefaultOptions,
+				WithDir(t.TempDir()),
+				WithEntryIdxMode(mode),
+				WithMaxBatchCount(10),
+			)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, db.Close()) }()
+
+			require.NoError(t, db.Update(func(tx *Tx) error {
+				return tx.NewKVBucket(bucket)
+			}))
+
+			const count = 100
+			const batchSize = 10
+			oldValue := func(i int) []byte {
+				return []byte(fmt.Sprintf("old-value-%03d", i))
+			}
+			newValue := func(i int) []byte {
+				return []byte(fmt.Sprintf("new-value-%03d", i))
+			}
+
+			wb, err := db.NewWriteBatch()
+			require.NoError(t, err)
+			for i := 0; i < count/2; i++ {
+				require.NoError(t, wb.Put(bucket, testutils.GetTestBytes(i), oldValue(i), Persistent))
+			}
+			require.NoError(t, wb.Flush())
+
+			wb, err = db.NewWriteBatch()
+			require.NoError(t, err)
+			for i := 0; i < count; i++ {
+				require.NoError(t, wb.Put(bucket, testutils.GetTestBytes(i), newValue(i), Persistent))
+				if (i+1)%batchSize != 0 {
+					continue
+				}
+
+				lastBatchStart := i + 1 - batchSize
+				require.NoError(t, db.View(func(tx *Tx) error {
+					for j := lastBatchStart; j <= i; j++ {
+						got, err := tx.Get(bucket, testutils.GetTestBytes(j))
+						require.NoError(t, err)
+						require.Equal(t, newValue(j), got)
+					}
+					return nil
+				}))
+			}
+			require.NoError(t, wb.Flush())
+
+			require.NoError(t, db.View(func(tx *Tx) error {
+				for i := 0; i < count; i++ {
+					got, err := tx.Get(bucket, testutils.GetTestBytes(i))
+					require.NoError(t, err)
+					require.Equal(t, newValue(i), got)
+				}
+				return nil
+			}))
+		})
 	}
 }
 

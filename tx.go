@@ -45,6 +45,7 @@ type Tx struct {
 	size              int64
 	pendingBucketList pendingBucketList
 	lockAcquired      atomic.Bool // track if lock was acquired (for WriteBatch optimization)
+	readIndexVersion  uint64      // overlay writes visible when this transaction began
 }
 
 type txnCb struct {
@@ -91,6 +92,7 @@ func newTx(db *DB, writable bool) (tx *Tx, err error) {
 		writable:          writable,
 		pendingWrites:     newPendingEntriesList(),
 		pendingBucketList: make(map[core.Ds]map[core.BucketName]*core.Bucket),
+		readIndexVersion:  db.indexOverlay.currentVersion(),
 	}
 	tx.setStatusRunning()
 
@@ -117,8 +119,12 @@ func (tx *Tx) CommitWith(cb func(error)) {
 
 	tx.setStatusCommitting()
 
+	db := tx.db
+	db.indexOverlay.publish(tx.id, tx.pendingWrites)
+
 	commitCb, err := tx.commitAndSend()
 	if err != nil {
+		db.indexOverlay.clear(tx.id)
 		tx.handleErr(err)
 		tx.setStatusClosed()
 		tx.unlock()
@@ -128,7 +134,15 @@ func (tx *Tx) CommitWith(cb func(error)) {
 		return
 	}
 
-	go runTxnCallback(&txnCb{user: cb, commit: commitCb})
+	go runTxnCallback(&txnCb{
+		user: func(err error) {
+			if err != nil {
+				db.indexOverlay.clear(tx.id)
+			}
+			cb(err)
+		},
+		commit: commitCb,
+	})
 }
 
 func (tx *Tx) commitAndSend() (func() error, error) {
@@ -175,6 +189,8 @@ func (tx *Tx) getTxID() uint64 {
 // 6. Unlock the database and clear the db field.
 func (tx *Tx) Commit() (err error) {
 	defer func() {
+		tx.db.indexOverlay.clear(tx.id)
+
 		if err != nil {
 			tx.handleErr(err)
 		}

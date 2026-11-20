@@ -73,6 +73,7 @@ type (
 		hintKeyAndRAMIdxModeLru *utils.LRUCache // lru cache for HintKeyAndRAMIdxMode
 		snowflakeMgr            *SnowflakeManager
 		watchMgr                *watchManager
+		indexOverlay            *indexOverlay
 	}
 )
 
@@ -112,6 +113,7 @@ func open(opt Options) (*DB, error) {
 	db.ttlService = ttl.NewService(ttl.NewRealClock(), opt.TTLConfig, db.handleExpiredKeys)
 
 	db.Index = db.newIndex()
+	db.indexOverlay = newIndexOverlay()
 
 	db.commitBuffer = createNewBufferWithSize(int(db.opt.CommitBufferSize))
 
