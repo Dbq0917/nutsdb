@@ -45,6 +45,7 @@ type Tx struct {
 	size              int64
 	pendingBucketList pendingBucketList
 	lockAcquired      atomic.Bool // track if lock was acquired (for WriteBatch optimization)
+	writeSeqs         map[*core.Entry]uint64
 }
 
 type txnCb struct {
@@ -91,6 +92,7 @@ func newTx(db *DB, writable bool) (tx *Tx, err error) {
 		writable:          writable,
 		pendingWrites:     newPendingEntriesList(),
 		pendingBucketList: make(map[core.Ds]map[core.BucketName]*core.Bucket),
+		writeSeqs:         make(map[*core.Entry]uint64),
 	}
 	tx.setStatusRunning()
 
@@ -205,6 +207,8 @@ func (tx *Tx) Commit() (err error) {
 		return ErrDBClosed
 	}
 
+	pendingWriteList := tx.pendingWriteList()
+
 	if tx.db.opt.MaxWriteRecordCount > 0 {
 		curWriteCount, err = tx.getNewAddRecordCount()
 		if err != nil {
@@ -221,7 +225,7 @@ func (tx *Tx) Commit() (err error) {
 	defer tx.setStatusClosed()
 
 	writesBucketLen := len(tx.pendingBucketList)
-	if tx.pendingWrites.size == 0 && writesBucketLen == 0 {
+	if len(pendingWriteList) == 0 && writesBucketLen == 0 {
 		return nil
 	}
 
@@ -230,7 +234,6 @@ func (tx *Tx) Commit() (err error) {
 
 	var records []*core.Record
 
-	pendingWriteList := tx.pendingWrites.toList()
 	lastIndex := len(pendingWriteList) - 1
 	for i := 0; i < len(pendingWriteList); i++ {
 		entry := pendingWriteList[i]
@@ -283,6 +286,7 @@ func (tx *Tx) Commit() (err error) {
 	if err := tx.buildIdxes(records, pendingWriteList); err != nil {
 		return err
 	}
+	tx.recordAppliedBTreeWriteSeqs(pendingWriteList)
 	tx.db.RecordCount += curWriteCount
 
 	tx.registerKeysForActiveExpiration(records, pendingWriteList)
@@ -600,6 +604,16 @@ func (tx *Tx) checkTxIsClosed() error {
 // put sets the value for a key in the bucket.
 // Returns an error if tx is closed, if performing a write operation on a read-only transaction, if the key is empty.
 func (tx *Tx) put(bucket string, key, value []byte, ttl uint32, flag uint16, timestamp uint64, ds uint16) (err error) {
+	return tx.putWithWriteSeq(bucket, key, value, ttl, flag, timestamp, ds, true)
+}
+
+// putInternal performs a write on behalf of database maintenance. Internal
+// rewrites must not supersede newer user writes that are still buffered.
+func (tx *Tx) putInternal(bucket string, key, value []byte, ttl uint32, flag uint16, timestamp uint64, ds uint16) (err error) {
+	return tx.putWithWriteSeq(bucket, key, value, ttl, flag, timestamp, ds, false)
+}
+
+func (tx *Tx) putWithWriteSeq(bucket string, key, value []byte, ttl uint32, flag uint16, timestamp uint64, ds uint16, withWriteSeq bool) (err error) {
 	if err := tx.checkTxIsClosed(); err != nil {
 		return err
 	}
@@ -623,9 +637,65 @@ func (tx *Tx) put(bucket string, key, value []byte, ttl uint32, flag uint16, tim
 	if err != nil {
 		return err
 	}
+	if withWriteSeq {
+		if tx.writeSeqs == nil {
+			tx.writeSeqs = make(map[*core.Entry]uint64)
+		}
+		tx.writeSeqs[e] = tx.db.writeSeq.Add(1)
+	}
 	tx.submitEntry(ds, bucket, e)
 	tx.size += e.Size()
 	return nil
+}
+
+func (tx *Tx) pendingWriteList() []*core.Entry {
+	list := tx.pendingWrites.toList()
+	if len(list) == 0 {
+		return list
+	}
+
+	filtered := make([]*core.Entry, 0, len(list))
+	for _, entry := range list {
+		if tx.isSupersededBTreeWrite(entry) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func (tx *Tx) isSupersededBTreeWrite(entry *core.Entry) bool {
+	if entry.Meta.Ds != DataStructureBTree {
+		return false
+	}
+	seq, ok := tx.writeSeqs[entry]
+	if !ok {
+		return false
+	}
+	latest, ok := tx.db.appliedBTreeWriteSeq[btreeWriteKey{
+		bucketID: entry.Meta.BucketId,
+		key:      string(entry.Key),
+	}]
+	return ok && latest > seq
+}
+
+func (tx *Tx) recordAppliedBTreeWriteSeqs(entries []*core.Entry) {
+	if tx.db.appliedBTreeWriteSeq == nil {
+		tx.db.appliedBTreeWriteSeq = make(map[btreeWriteKey]uint64)
+	}
+	for _, entry := range entries {
+		if entry.Meta.Ds != DataStructureBTree {
+			continue
+		}
+		seq, ok := tx.writeSeqs[entry]
+		if !ok {
+			continue
+		}
+		tx.db.appliedBTreeWriteSeq[btreeWriteKey{
+			bucketID: entry.Meta.BucketId,
+			key:      string(entry.Key),
+		}] = seq
+	}
 }
 
 // setStatusCommitting will change the tx status to txStatusCommitting
@@ -747,6 +817,9 @@ func (tx *Tx) getChangeCountInEntriesChanges() (int64, error) {
 	var res int64
 	for _, entriesInDS := range tx.pendingWrites.entriesInBTree {
 		for _, entry := range entriesInDS {
+			if tx.isSupersededBTreeWrite(entry) {
+				continue
+			}
 			curRecordCnt, err := tx.getEntryNewAddRecordCount(entry)
 			if err != nil {
 				return res, nil

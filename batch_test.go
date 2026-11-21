@@ -349,3 +349,78 @@ func TestWriteBatch_ConcurrentWithUpdate(t *testing.T) {
 		require.NoError(t, <-done)
 	}
 }
+
+func TestWriteBatch_InterleavedWithSingleWritesPreservesCallOrder(t *testing.T) {
+	t.Run("buffered_batch_does_not_override_later_single_write", func(t *testing.T) {
+		dir := t.TempDir()
+		db, err := Open(DefaultOptions, WithDir(dir))
+		require.NoError(t, err)
+
+		const bucket = "write-order-bucket"
+		key := []byte("shared-key")
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		wb, err := db.NewWriteBatch()
+		require.NoError(t, err)
+
+		require.NoError(t, wb.Put(bucket, key, []byte("batch-1"), Persistent))
+		require.NoError(t, db.Update(func(tx *Tx) error {
+			return tx.Put(bucket, key, []byte("single-2"), Persistent)
+		}))
+		require.NoError(t, wb.Put(bucket, key, []byte("batch-3"), Persistent))
+		require.NoError(t, db.Update(func(tx *Tx) error {
+			return tx.Put(bucket, key, []byte("single-4"), Persistent)
+		}))
+		require.NoError(t, wb.Flush())
+
+		txGet(t, db, bucket, key, []byte("single-4"), nil)
+		require.NoError(t, db.Close())
+
+		db, err = Open(DefaultOptions, WithDir(dir))
+		require.NoError(t, err)
+		defer func() { require.NoError(t, db.Close()) }()
+		txGet(t, db, bucket, key, []byte("single-4"), nil)
+	})
+
+	t.Run("buffered_batch_applies_after_earlier_single_write", func(t *testing.T) {
+		runNutsDBTest(t, nil, func(t *testing.T, db *DB) {
+			const bucket = "write-order-bucket"
+			key := []byte("shared-key")
+			txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+			wb, err := db.NewWriteBatch()
+			require.NoError(t, err)
+
+			require.NoError(t, db.Update(func(tx *Tx) error {
+				return tx.Put(bucket, key, []byte("single-1"), Persistent)
+			}))
+			require.NoError(t, wb.Put(bucket, key, []byte("batch-2"), Persistent))
+			require.NoError(t, db.Update(func(tx *Tx) error {
+				return tx.Put(bucket, key, []byte("single-3"), Persistent)
+			}))
+			require.NoError(t, wb.Put(bucket, key, []byte("batch-4"), Persistent))
+			require.NoError(t, wb.Flush())
+
+			txGet(t, db, bucket, key, []byte("batch-4"), nil)
+		})
+	})
+
+	t.Run("buffered_batch_delete_does_not_override_later_single_write", func(t *testing.T) {
+		runNutsDBTest(t, nil, func(t *testing.T, db *DB) {
+			const bucket = "write-order-bucket"
+			key := []byte("shared-key")
+			txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+			txPut(t, db, bucket, key, []byte("initial"), Persistent, nil, nil)
+
+			wb, err := db.NewWriteBatch()
+			require.NoError(t, err)
+			require.NoError(t, wb.Delete(bucket, key))
+			require.NoError(t, db.Update(func(tx *Tx) error {
+				return tx.Put(bucket, key, []byte("single-latest"), Persistent)
+			}))
+			require.NoError(t, wb.Flush())
+
+			txGet(t, db, bucket, key, []byte("single-latest"), nil)
+		})
+	})
+}

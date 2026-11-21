@@ -140,7 +140,7 @@ func (db *DB) mergeLegacy() error {
 								return err
 							}
 						default:
-							if err := tx.put(
+							if err := tx.putInternal(
 								bucketName,
 								entry.Key,
 								entry.Value,

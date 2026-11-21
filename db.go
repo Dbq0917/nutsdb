@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bwmarrin/snowflake"
@@ -73,8 +74,16 @@ type (
 		hintKeyAndRAMIdxModeLru *utils.LRUCache // lru cache for HintKeyAndRAMIdxMode
 		snowflakeMgr            *SnowflakeManager
 		watchMgr                *watchManager
+		writeSeq                atomic.Uint64            // next sequence assigned at write-call time
+		appliedBTreeWriteSeq    map[btreeWriteKey]uint64 // last applied user write per BTree key
 	}
 )
+
+// btreeWriteKey identifies a BTree key whose writes must be applied in call order.
+type btreeWriteKey struct {
+	bucketID core.BucketId
+	key      string
+}
 
 // NewSnowflakeManager creates a new SnowflakeManager with the given node number
 func NewSnowflakeManager(nodeNum int64) *SnowflakeManager {
@@ -107,6 +116,7 @@ func open(opt Options) (*DB, error) {
 		writeCh:                 make(chan *request, KvWriteChCapacity),
 		hintKeyAndRAMIdxModeLru: utils.NewLruCache(opt.HintKeyAndRAMIdxCacheSize),
 		snowflakeMgr:            NewSnowflakeManager(opt.NodeNum),
+		appliedBTreeWriteSeq:    make(map[btreeWriteKey]uint64),
 	}
 
 	db.ttlService = ttl.NewService(ttl.NewRealClock(), opt.TTLConfig, db.handleExpiredKeys)
@@ -1142,7 +1152,7 @@ func (db *DB) handleExpiredKeys(events []*ttl.ExpirationEvent) {
 				// Only delete if timestamp matches (same record that expired)
 				// Also verify it's actually expired (in case it was updated)
 				if record.Timestamp == event.Timestamp && db.ttlService.IsExpired(record.TTL, record.Timestamp) {
-					_ = tx.put(bucket.Name, event.Key, nil, Persistent, DataDeleteFlag, uint64(db.ttlService.NowMillis()), bucket.Ds)
+					_ = tx.putInternal(bucket.Name, event.Key, nil, Persistent, DataDeleteFlag, uint64(db.ttlService.NowMillis()), bucket.Ds)
 					// Deregister from timing wheel to prevent duplicate expiration events
 					db.ttlService.DeregisterKeyFromActiveExpiration(bucketId, event.Key)
 				}
