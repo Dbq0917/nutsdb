@@ -73,6 +73,7 @@ type (
 		hintKeyAndRAMIdxModeLru *utils.LRUCache // lru cache for HintKeyAndRAMIdxMode
 		snowflakeMgr            *SnowflakeManager
 		watchMgr                *watchManager
+		segmentRotation         *segmentRotation
 	}
 )
 
@@ -107,6 +108,7 @@ func open(opt Options) (*DB, error) {
 		writeCh:                 make(chan *request, KvWriteChCapacity),
 		hintKeyAndRAMIdxModeLru: utils.NewLruCache(opt.HintKeyAndRAMIdxCacheSize),
 		snowflakeMgr:            NewSnowflakeManager(opt.NodeNum),
+		segmentRotation:         newSegmentRotation(),
 	}
 
 	db.ttlService = ttl.NewService(ttl.NewRealClock(), opt.TTLConfig, db.handleExpiredKeys)

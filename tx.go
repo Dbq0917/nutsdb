@@ -232,6 +232,14 @@ func (tx *Tx) Commit() (err error) {
 
 	pendingWriteList := tx.pendingWrites.toList()
 	lastIndex := len(pendingWriteList) - 1
+
+	// Mark this transaction as persisting so the rotation gate knows a write
+	// may be straddling the current segment boundary. The mark is held until
+	// every entry of the transaction is durable, including entries that land
+	// in the next segment after a rollover.
+	tx.db.segmentRotation.beginWriting(tx.id)
+	defer tx.db.segmentRotation.endWriting(tx.id)
+
 	for i := 0; i < len(pendingWriteList); i++ {
 		entry := pendingWriteList[i]
 		entrySize := entry.Size()
@@ -239,13 +247,21 @@ func (tx *Tx) Commit() (err error) {
 			return ErrDataSizeExceed
 		}
 
-		if tx.db.ActiveFile.ActualSize+int64(buff.Len())+entrySize > tx.db.opt.SegmentSize {
+		for tx.db.ActiveFile.ActualSize+int64(buff.Len())+entrySize > tx.db.opt.SegmentSize {
+			// Flush everything buffered for this transaction into the current
+			// segment before it is rolled over.
 			if _, err := tx.writeData(buff.Bytes()); err != nil {
 				return err
 			}
 			buff.Reset()
 
-			if err := tx.rotateActiveFile(); err != nil {
+			// Coordinate the rollover: only one rotation runs at a time, and
+			// it never runs while another writer is persisting a transaction
+			// that may straddle the boundary. rotate parks (without spinning)
+			// until the gate is clear and returns only after a fresh active
+			// file is installed, so re-checking the space always makes
+			// progress instead of forcing a redundant rollover.
+			if _, err := tx.db.segmentRotation.rotate(tx.id, tx.rotateActiveFile); err != nil {
 				return err
 			}
 		}
