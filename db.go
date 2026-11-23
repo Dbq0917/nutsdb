@@ -633,7 +633,10 @@ func (db *DB) parseDataFiles(dataFileIds []int64) (err error) {
 
 		// Try to load hint file first if enabled
 		if db.opt.EnableHintFile {
-			hintLoaded, _ := db.loadHintFile(fID)
+			hintLoaded, err := db.loadHintFile(fID)
+			if err != nil {
+				return err
+			}
 
 			if hintLoaded {
 				// Hint file loaded successfully, skip scanning data file
@@ -659,7 +662,10 @@ func (db *DB) parseDataFiles(dataFileIds []int64) (err error) {
 	return
 }
 
-// loadHintFile loads a single hint file and rebuilds indexes
+// loadHintFile loads a single hint file and rebuilds indexes.
+// When the hint file belongs to the active segment, it also restores the
+// segment write offset so subsequent writes append instead of overwriting
+// records that are already referenced by the recovered index.
 func (db *DB) loadHintFile(fid int64) (bool, error) {
 	hintPath := getHintPath(fid, db.opt.Dir)
 
@@ -679,6 +685,11 @@ func (db *DB) loadHintFile(fid int64) (bool, error) {
 		}
 	}()
 
+	var (
+		lastDataPos int64
+		hasHint     bool
+	)
+
 	// Read all hint entries and build indexes
 	for {
 		hintEntry, err := reader.Read()
@@ -691,6 +702,11 @@ func (db *DB) loadHintFile(fid int64) (bool, error) {
 
 		if hintEntry == nil {
 			continue
+		}
+
+		if !hasHint || int64(hintEntry.DataPos) > lastDataPos {
+			lastDataPos = int64(hintEntry.DataPos)
+			hasHint = true
 		}
 
 		// Check if bucket exists
@@ -758,7 +774,55 @@ func (db *DB) loadHintFile(fid int64) (bool, error) {
 		db.KeyCount++
 	}
 
+	if fid == db.MaxFileID {
+		start := int64(0)
+		if hasHint {
+			start = lastDataPos
+		}
+		end, err := db.activeFileEndOffset(fid, start)
+		if err != nil {
+			return false, err
+		}
+		db.ActiveFile.ActualSize = end
+		db.ActiveFile.writeOff = end
+	}
+
 	return true, nil
+}
+
+// activeFileEndOffset returns the append offset of the active segment. It
+// starts at the last hinted entry so a stale hint file cannot leave newer
+// records beyond the recovered offset without replaying the whole segment
+// through the index builders.
+func (db *DB) activeFileEndOffset(fid int64, start int64) (int64, error) {
+	path := getDataPath(fid, db.opt.Dir)
+	fr, err := newFileRecovery(path, db.opt.BufferSizeOfRecovery)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		_ = fr.release()
+	}()
+
+	off := start
+	for {
+		entry, err := fr.readEntry(off)
+		if err != nil {
+			if errors.Is(err, io.EOF) ||
+				errors.Is(err, ErrIndexOutOfBound) ||
+				errors.Is(err, io.ErrUnexpectedEOF) ||
+				errors.Is(err, core.ErrHeaderSizeOutOfBounds) {
+				break
+			}
+			return 0, fmt.Errorf("read active data file %s at offset %d: %w", path, off, err)
+		}
+		if entry == nil {
+			break
+		}
+		off += entry.Size()
+	}
+
+	return off, nil
 }
 
 func (db *DB) getRecordCount() (int64, error) {
