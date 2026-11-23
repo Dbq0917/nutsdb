@@ -185,12 +185,18 @@ func (db *DB) mergeLegacy() error {
 		mergingPath[i] = path
 	}
 
-	db.mu.Lock()
-	endFileID := db.MaxFileID
-	db.mu.Unlock()
-
 	if db.opt.EnableHintFile {
-		if err := db.buildHintFilesAfterMerge(startFileID, endFileID); err != nil {
+		// Never build a hint file for the active data file (db.MaxFileID):
+		// it keeps accepting writes after the merge, and recovery prefers
+		// hint files over scanning data files, so a stale hint would shadow
+		// later entries (including delete tombstones) on the next open.
+		// Only sealed files get hint files; the active file is scanned on
+		// recovery instead.
+		db.mu.Lock()
+		endFileID := db.MaxFileID
+		db.mu.Unlock()
+
+		if err := db.buildHintFilesAfterMerge(startFileID, endFileID-1); err != nil {
 			return fmt.Errorf("failed to build hint files after merge: %w", err)
 		}
 	}

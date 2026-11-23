@@ -16,6 +16,7 @@ package nutsdb
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nutsdb/nutsdb/internal/core"
 	"github.com/nutsdb/nutsdb/internal/testutils"
 	"github.com/nutsdb/nutsdb/internal/ttl"
 	"github.com/stretchr/testify/require"
@@ -59,7 +61,44 @@ func dataFileIDsForMode(mode mergeTestMode, sets mergeFileSets) []int64 {
 	if mode.enableMergeV2 {
 		return sets.mergeIDs
 	}
-	return sets.userIDs
+	// Legacy merge writes hint files only for sealed data files. The active
+	// file (the highest user file ID) never gets one, because it is still
+	// accepting writes and a stale hint would shadow them on recovery.
+	if len(sets.userIDs) == 0 {
+		return nil
+	}
+	return sets.userIDs[:len(sets.userIDs)-1]
+}
+
+// countActiveFileEntries scans the active data file and returns the number
+// of entries in it, both in total and broken down by data structure. The
+// active file has no hint file, so its entries are not reflected in any
+// hint-entry count.
+func countActiveFileEntries(t *testing.T, db *DB) (total int, perDS map[uint16]int) {
+	t.Helper()
+	perDS = make(map[uint16]int)
+	path := getDataPath(db.MaxFileID, db.opt.Dir)
+	fr, err := newFileRecovery(path, db.opt.BufferSizeOfRecovery)
+	require.NoError(t, err)
+	defer func() { _ = fr.release() }()
+
+	off := int64(0)
+	for {
+		entry, err := fr.readEntry(off)
+		if err != nil {
+			require.True(t, errors.Is(err, io.EOF) || errors.Is(err, ErrIndexOutOfBound) ||
+				errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrEntryZero) ||
+				errors.Is(err, core.ErrHeaderSizeOutOfBounds), "unexpected read error: %v", err)
+			break
+		}
+		if entry == nil {
+			break
+		}
+		total++
+		perDS[entry.Meta.Ds]++
+		off += entry.Size()
+	}
+	return total, perDS
 }
 
 func unionDataFileIDs(sets mergeFileSets) []int64 {
@@ -676,7 +715,10 @@ func TestDB_MergeWithHintFile(t *testing.T) {
 				totalHintEntryCount += hintEntryCount
 			}
 
-			require.Equal(t, n/2, totalHintEntryCount)
+			// Entries rewritten into the still-active data file have no hint
+			// entries; count them from the data file itself.
+			activeCount, _ := countActiveFileEntries(t, db)
+			require.Equal(t, n/2, totalHintEntryCount+activeCount)
 
 			dbCnt, err := db.getRecordCount()
 			require.NoError(t, err)
@@ -934,10 +976,13 @@ func TestDB_MergeHintFileDifferentDataStructures(t *testing.T) {
 			_ = reader.Close()
 		}
 
-		require.Equal(t, 75, btreeCount)
-		require.Equal(t, 40, setCount)
-		require.Equal(t, 25, listCount)
-		require.Equal(t, 15, zsetCount)
+		// Entries rewritten into the still-active data file have no hint
+		// entries; count them from the data file itself.
+		_, activePerDS := countActiveFileEntries(t, db)
+		require.Equal(t, 75, btreeCount+activePerDS[DataStructureBTree])
+		require.Equal(t, 40, setCount+activePerDS[DataStructureSet])
+		require.Equal(t, 25, listCount+activePerDS[DataStructureList])
+		require.Equal(t, 15, zsetCount+activePerDS[DataStructureSortedSet])
 
 		require.NoError(t, db.Close())
 		db, err = Open(opts)
@@ -970,6 +1015,54 @@ func TestDB_MergeHintFileDifferentDataStructures(t *testing.T) {
 
 		require.NoError(t, db.Close())
 		removeDir(opts.Dir)
+	})
+}
+
+// TestDB_MergeDeleteAfterMergeWithHintFile verifies that writes committed
+// after a merge (deletes in particular) survive a reopen when hint files are
+// enabled. The merge must not leave a hint file for the still-active data
+// file: recovery prefers hint files over scanning data files, so a stale
+// hint would shadow the tombstone and the deleted key would come back.
+func TestDB_MergeDeleteAfterMergeWithHintFile(t *testing.T) {
+	runForMergeModes(t, func(t *testing.T, mode mergeTestMode) {
+		bucket := "bucket"
+		opts := DefaultOptions
+		opts.SegmentSize = KB
+		opts.Dir = fmt.Sprintf("/tmp/test-merge-delete-after-merge-%s/", mode.name)
+		opts.EnableHintFile = true
+		opts.EnableMergeV2 = mode.enableMergeV2
+
+		removeDir(opts.Dir)
+		defer removeDir(opts.Dir)
+
+		db, err := Open(opts)
+		require.NoError(t, err)
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		n := 2000
+		for i := 0; i < n; i++ {
+			txPut(t, db, bucket, testutils.GetTestBytes(i), testutils.GetTestBytes(i), Persistent, nil, nil)
+		}
+
+		require.NoError(t, db.Merge())
+
+		// Delete and put after the merge: these land in the active data file.
+		txDel(t, db, bucket, testutils.GetTestBytes(n-1), nil)
+		txPut(t, db, bucket, []byte("brand_new_key"), []byte("brand_new_value"), Persistent, nil, nil)
+
+		require.NoError(t, db.Close())
+
+		db, err = Open(opts)
+		require.NoError(t, err)
+
+		// The deleted key must stay deleted.
+		txGet(t, db, bucket, testutils.GetTestBytes(n-1), nil, ErrKeyNotFound)
+		// The key written after the merge must survive the reopen.
+		txGet(t, db, bucket, []byte("brand_new_key"), []byte("brand_new_value"), nil)
+		// Untouched keys must be intact.
+		txGet(t, db, bucket, testutils.GetTestBytes(0), testutils.GetTestBytes(0), nil)
+
+		require.NoError(t, db.Close())
 	})
 }
 

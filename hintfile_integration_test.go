@@ -202,9 +202,11 @@ func TestHintFileIntegration_MultipleMerges(t *testing.T) {
 
 		// Perform multiple rounds of write->delete->merge
 		for round := 0; round < 3; round++ {
-			// Write data
-			start := round * 500
-			end := (round + 1) * 500
+			// Write data. Each round writes enough live entries that the
+			// merge output exceeds one segment, so at least one sealed data
+			// file (which gets a hint file) remains after every merge.
+			start := round * 1000
+			end := (round + 1) * 1000
 			for i := start; i < end; i++ {
 				txPut(t, db, bucket, testutils.GetTestBytes(i), testutils.GetTestBytes(i), Persistent, nil, nil)
 			}
@@ -232,8 +234,8 @@ func TestHintFileIntegration_MultipleMerges(t *testing.T) {
 
 		// Verify all data is correct
 		for round := 0; round < 3; round++ {
-			start := round * 500
-			end := (round + 1) * 500
+			start := round * 1000
+			end := (round + 1) * 1000
 
 			// Check deleted data
 			for i := start; i < start+100; i++ {
@@ -253,8 +255,8 @@ func TestHintFileIntegration_MultipleMerges(t *testing.T) {
 		require.NoError(t, err)
 
 		for round := 0; round < 3; round++ {
-			start := round * 500
-			end := (round + 1) * 500
+			start := round * 1000
+			end := (round + 1) * 1000
 
 			// Check deleted data
 			for i := start; i < start+100; i++ {
