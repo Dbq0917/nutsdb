@@ -594,24 +594,25 @@ func (db *DB) parseDataFiles(dataFileIds []int64) (err error) {
 				Fid:   fID,
 				Off:   off,
 			}
+
+			// Entries of one transaction may be split across segment files.
+			// Keep collecting as long as the tx ID matches, but never let a
+			// committed entry from another transaction finalize a partially
+			// written transaction left in an earlier segment.
+			if dataInTx.TxId != 0 && !dataInTx.IsSameTx(entryWhenRecovery) {
+				dataInTx.Reset()
+			}
 			if dataInTx.TxId == 0 {
-				dataInTx.AppendEntry(entryWhenRecovery)
 				dataInTx.TxId = entry.Meta.TxID
 				dataInTx.StartOff = off
-			} else if dataInTx.IsSameTx(entryWhenRecovery) {
-				dataInTx.AppendEntry(entryWhenRecovery)
 			}
+			dataInTx.AppendEntry(entryWhenRecovery)
 
 			if entry.Meta.Status == Committed {
 				err := parseDataInTx()
 				if err != nil {
 					return err
 				}
-				dataInTx.Reset()
-				dataInTx.StartOff = off
-			}
-
-			if !dataInTx.IsSameTx(entryWhenRecovery) {
 				dataInTx.Reset()
 				dataInTx.StartOff = off
 			}

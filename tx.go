@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync/atomic"
 
@@ -164,7 +165,9 @@ func (tx *Tx) getTxID() uint64 {
 //
 // 1. check the length of pendingWrites.If there are no writes, return immediately.
 //
-// 2. check if the ActiveFile has not enough space to store entry. if not, call rotateActiveFile function.
+// 2. If the transaction fits in one segment but not in the remaining space of
+// the ActiveFile, rotate before writing. Transactions larger than a segment may
+// span segments and are recovered as a unit.
 //
 // 3. write pendingWrites to disk, if a non-nil error,return the error.
 //
@@ -231,20 +234,50 @@ func (tx *Tx) Commit() (err error) {
 	var records []*core.Record
 
 	pendingWriteList := tx.pendingWrites.toList()
+	txStartFileID := tx.db.ActiveFile.fileID
+	txStartOffset := tx.db.ActiveFile.ActualSize
+	writesStarted := false
+	rotated := false
+	defer func() {
+		if err == nil || (!writesStarted && !rotated) {
+			return
+		}
+		if rollbackErr := tx.rollbackCommitData(txStartFileID, txStartOffset); rollbackErr != nil {
+			err = fmt.Errorf("%w (rollback commit data: %v)", err, rollbackErr)
+		}
+	}()
+
+	var txSize int64
+	for _, entry := range pendingWriteList {
+		if entry.Size() > tx.db.opt.SegmentSize {
+			return ErrDataSizeExceed
+		}
+		txSize += entry.Size()
+	}
+
+	// Keep the whole transaction in one segment when it can fit there. Only
+	// transactions larger than a segment have to span multiple segments.
+	if txSize <= tx.db.opt.SegmentSize && tx.db.ActiveFile.ActualSize > 0 &&
+		tx.db.ActiveFile.ActualSize+txSize > tx.db.opt.SegmentSize {
+		rotated = true
+		if err := tx.rotateActiveFile(); err != nil {
+			return err
+		}
+	}
+
 	lastIndex := len(pendingWriteList) - 1
 	for i := 0; i < len(pendingWriteList); i++ {
 		entry := pendingWriteList[i]
 		entrySize := entry.Size()
-		if entrySize > tx.db.opt.SegmentSize {
-			return ErrDataSizeExceed
-		}
 
 		if tx.db.ActiveFile.ActualSize+int64(buff.Len())+entrySize > tx.db.opt.SegmentSize {
+			writesStarted = true
 			if _, err := tx.writeData(buff.Bytes()); err != nil {
 				return err
 			}
 			buff.Reset()
 
+			rotated = true
 			if err := tx.rotateActiveFile(); err != nil {
 				return err
 			}
@@ -261,6 +294,7 @@ func (tx *Tx) Commit() (err error) {
 		}
 
 		if i == lastIndex {
+			writesStarted = true
 			if _, err := tx.writeData(buff.Bytes()); err != nil {
 				return err
 			}
@@ -297,6 +331,57 @@ func (tx *Tx) Commit() (err error) {
 	}
 
 	return nil
+}
+
+// rollbackCommitData restores the active data file to the position it had
+// before the transaction started writing and removes segments created by the
+// failed commit. This makes a failed cross-segment commit atomic on disk.
+func (tx *Tx) rollbackCommitData(fileID, offset int64) error {
+	db := tx.db
+	if db == nil || db.ActiveFile == nil {
+		return nil
+	}
+
+	var firstErr error
+	if db.ActiveFile.rwManager != nil {
+		if err := db.ActiveFile.rwManager.Release(); err != nil {
+			firstErr = err
+		}
+	}
+
+	for id := fileID + 1; id <= db.MaxFileID; id++ {
+		path := getDataPath(id, db.opt.Dir)
+		_ = db.fm.fdm.CloseByPath(path)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+
+	path := getDataPath(fileID, db.opt.Dir)
+	_ = db.fm.fdm.CloseByPath(path)
+	if err := os.Truncate(path, offset); err != nil {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	activeFile, err := db.fm.GetDataFile(path, db.opt.SegmentSize)
+	if err != nil {
+		if firstErr == nil {
+			firstErr = err
+		}
+		return firstErr
+	}
+	activeFile.fileID = fileID
+	activeFile.ActualSize = offset
+	activeFile.writeOff = offset
+
+	db.MaxFileID = fileID
+	db.ActiveFile = activeFile
+
+	return firstErr
 }
 
 func (tx *Tx) getNewAddRecordCount() (int64, error) {

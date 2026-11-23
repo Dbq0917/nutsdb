@@ -16,10 +16,13 @@ package nutsdb
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/nutsdb/nutsdb/internal/core"
+	"github.com/nutsdb/nutsdb/internal/fileio"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -63,6 +66,233 @@ func TestTx_Rollback(t *testing.T) {
 		}
 
 	})
+}
+
+type failOnceReleaseManager struct {
+	fileio.RWManager
+	failed bool
+}
+
+func (m *failOnceReleaseManager) Release() error {
+	if !m.failed {
+		m.failed = true
+		return fmt.Errorf("injected segment rotation failure")
+	}
+	return m.RWManager.Release()
+}
+
+func TestTx_CommitKeepsBatchInOneSegment(t *testing.T) {
+	opts := DefaultOptions
+	opts.Dir = filepath.Join(t.TempDir(), "nutsdb-segment-batch")
+	opts.SegmentSize = 4 * KB
+	opts.EntryIdxMode = HintKeyAndRAMIdxMode
+
+	db, err := Open(opts)
+	assert.NoError(t, err)
+	defer func() {
+		if db != nil && !db.IsClose() {
+			assert.NoError(t, db.Close())
+		}
+	}()
+
+	bucket := "segment_batch"
+	txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+	err = db.Update(func(tx *Tx) error {
+		return tx.Put(bucket, []byte("filler"), make([]byte, 3000), Persistent)
+	})
+	assert.NoError(t, err)
+
+	startFileID := db.ActiveFile.fileID
+	startOffset := db.ActiveFile.ActualSize
+
+	err = db.Update(func(tx *Tx) error {
+		for i := 0; i < 30; i++ {
+			key := []byte(fmt.Sprintf("batch-%02d", i))
+			if err := tx.Put(bucket, key, []byte("01234567890123456789"), Persistent); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	assert.NoError(t, err)
+
+	assert.Greater(t, db.ActiveFile.fileID, startFileID)
+	assert.Greater(t, startOffset, int64(0))
+
+	err = db.View(func(tx *Tx) error {
+		_, b := tx.getBucketAndItsStatus(DataStructureBTree, bucket)
+		idx, ok := tx.db.Index.BTree.exist(b.Id)
+		if !ok {
+			return fmt.Errorf("bucket index not found")
+		}
+		for i := 0; i < 30; i++ {
+			record, found := idx.Find([]byte(fmt.Sprintf("batch-%02d", i)))
+			if !found {
+				return fmt.Errorf("batch-%02d not found", i)
+			}
+			if record.FileID != db.ActiveFile.fileID {
+				return fmt.Errorf("batch-%02d stored in file %d, want %d", i, record.FileID, db.ActiveFile.fileID)
+			}
+		}
+		return nil
+	})
+	assert.NoError(t, err)
+}
+
+func TestTx_CommitFailureRollsBackWholeBatchAcrossSegments(t *testing.T) {
+	opts := DefaultOptions
+	opts.Dir = filepath.Join(t.TempDir(), "nutsdb-segment-rollback")
+	opts.SegmentSize = 2 * KB
+	opts.EntryIdxMode = HintKeyAndRAMIdxMode
+
+	db, err := Open(opts)
+	assert.NoError(t, err)
+	defer func() {
+		if db != nil && !db.IsClose() {
+			assert.NoError(t, db.Close())
+		}
+	}()
+
+	bucket := "segment_rollback"
+	txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+	err = db.Update(func(tx *Tx) error {
+		return tx.Put(bucket, []byte("filler"), make([]byte, 1500), Persistent)
+	})
+	assert.NoError(t, err)
+
+	startFileID := db.ActiveFile.fileID
+	startOffset := db.ActiveFile.ActualSize
+
+	tx, err := db.Begin(true)
+	assert.NoError(t, err)
+	for i := 0; i < 30; i++ {
+		key := []byte(fmt.Sprintf("batch-%02d", i))
+		err = tx.Put(bucket, key, make([]byte, 64), Persistent)
+		assert.NoError(t, err)
+	}
+
+	realManager := db.ActiveFile.rwManager
+	db.ActiveFile.rwManager = &failOnceReleaseManager{RWManager: realManager}
+
+	err = tx.Commit()
+	assert.Error(t, err)
+	assert.Equal(t, startFileID, db.ActiveFile.fileID)
+	assert.Equal(t, startOffset, db.ActiveFile.ActualSize)
+	assert.Equal(t, startFileID, db.MaxFileID)
+
+	err = db.View(func(tx *Tx) error {
+		for i := 0; i < 30; i++ {
+			key := []byte(fmt.Sprintf("batch-%02d", i))
+			if _, err := tx.Get(bucket, key); err == nil {
+				return fmt.Errorf("%s survived a failed commit", key)
+			}
+		}
+		if _, err := tx.RangeScan(bucket, []byte("batch-00"), []byte("batch-99")); err == nil {
+			return fmt.Errorf("range scan found entries from a failed commit")
+		}
+		return nil
+	})
+	assert.NoError(t, err)
+
+	err = db.Update(func(tx *Tx) error {
+		return tx.Put(bucket, []byte("after"), []byte("visible"), Persistent)
+	})
+	assert.NoError(t, err)
+
+	assert.NoError(t, db.Close())
+	db, err = Open(opts)
+	assert.NoError(t, err)
+
+	err = db.View(func(tx *Tx) error {
+		value, err := tx.Get(bucket, []byte("filler"))
+		if err != nil {
+			return err
+		}
+		if len(value) != 1500 {
+			return fmt.Errorf("filler value length = %d, want 1500", len(value))
+		}
+		value, err = tx.Get(bucket, []byte("after"))
+		if err != nil {
+			return err
+		}
+		if string(value) != "visible" {
+			return fmt.Errorf("after = %q, want visible", value)
+		}
+		for i := 0; i < 30; i++ {
+			key := []byte(fmt.Sprintf("batch-%02d", i))
+			if _, err := tx.Get(bucket, key); err == nil {
+				return fmt.Errorf("%s survived reopen after a failed commit", key)
+			}
+		}
+		return nil
+	})
+	assert.NoError(t, err)
+}
+
+func TestRecoveryDoesNotCommitPartialTxFromPreviousSegment(t *testing.T) {
+	opts := DefaultOptions
+	opts.Dir = filepath.Join(t.TempDir(), "nutsdb-segment-recovery")
+	opts.SegmentSize = KB
+
+	db, err := Open(opts)
+	assert.NoError(t, err)
+	defer func() {
+		if db != nil && !db.IsClose() {
+			assert.NoError(t, db.Close())
+		}
+	}()
+
+	bucket := "segment_recovery"
+	txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+	bucketMeta, err := db.bucketMgr.GetBucket(DataStructureBTree, bucket)
+	assert.NoError(t, err)
+	bucketID := bucketMeta.Id
+	assert.NoError(t, db.Close())
+
+	encodeEntry := func(txID uint64, key, value string, status uint16) []byte {
+		meta := core.NewMetaData().
+			WithTimeStamp(1).
+			WithKeySize(uint32(len(key))).
+			WithValueSize(uint32(len(value))).
+			WithFlag(DataSetFlag).
+			WithTTL(Persistent).
+			WithStatus(status).
+			WithDs(DataStructureBTree).
+			WithTxID(txID).
+			WithBucketId(bucketID)
+		return core.NewEntry().WithKey([]byte(key)).WithValue([]byte(value)).WithMeta(meta).Encode()
+	}
+
+	partial := encodeEntry(101, "partial-0", "v0", UnCommitted)
+	partial = append(partial, encodeEntry(101, "partial-1", "v1", UnCommitted)...)
+	assert.NoError(t, os.WriteFile(getDataPath(0, opts.Dir), partial, 0o644))
+
+	committed := encodeEntry(202, "committed", "ok", Committed)
+	assert.NoError(t, os.WriteFile(getDataPath(1, opts.Dir), committed, 0o644))
+
+	db, err = Open(opts)
+	assert.NoError(t, err)
+
+	err = db.View(func(tx *Tx) error {
+		for i := 0; i < 2; i++ {
+			key := []byte(fmt.Sprintf("partial-%d", i))
+			if _, err := tx.Get(bucket, key); err == nil {
+				return fmt.Errorf("%s from an incomplete transaction was recovered", key)
+			}
+		}
+		value, err := tx.Get(bucket, []byte("committed"))
+		if err != nil {
+			return err
+		}
+		if string(value) != "ok" {
+			return fmt.Errorf("committed = %q, want ok", value)
+		}
+		return nil
+	})
+	assert.NoError(t, err)
 }
 
 func TestTx_Begin(t *testing.T) {
