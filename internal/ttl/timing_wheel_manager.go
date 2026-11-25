@@ -109,11 +109,20 @@ func newTimerRegistry() *timerRegistry {
 	return &timerRegistry{}
 }
 
-// register stores a timer in the registry for later cancellation.
-// The timer is indexed by a unique key derived from bucketId and keyHash.
-func (r *timerRegistry) register(bucketId uint64, keyHash uint64, timer *timingwheel.Timer) {
+// register stores a timer in the registry for later cancellation. If another
+// timer is already registered for the same key, it is stopped and replaced.
+// It reports whether an existing timer was replaced.
+func (r *timerRegistry) register(
+	bucketId uint64,
+	keyHash uint64,
+	timer *timingwheel.Timer,
+) (replaced bool) {
 	key := makeRegistryKey(bucketId, keyHash)
-	r.timers.Store(key, timer)
+	previous, loaded := r.timers.Swap(key, timer)
+	if loaded {
+		previous.(*timingwheel.Timer).Stop()
+	}
+	return loaded
 }
 
 // deregister cancels and removes a timer from the registry.
@@ -121,8 +130,7 @@ func (r *timerRegistry) register(bucketId uint64, keyHash uint64, timer *timingw
 func (r *timerRegistry) deregister(bucketId uint64, keyHash uint64) bool {
 	key := makeRegistryKey(bucketId, keyHash)
 	if value, exists := r.timers.LoadAndDelete(key); exists {
-		timer := value.(*timingwheel.Timer)
-		timer.Stop()
+		value.(*timingwheel.Timer).Stop()
 		return true
 	}
 	return false
@@ -132,8 +140,7 @@ func (r *timerRegistry) deregister(bucketId uint64, keyHash uint64) bool {
 // Used during shutdown to clean up all pending timers.
 func (r *timerRegistry) clear() {
 	r.timers.Range(func(key, value interface{}) bool {
-		timer := value.(*timingwheel.Timer)
-		timer.Stop()
+		value.(*timingwheel.Timer).Stop()
 		r.timers.Delete(key)
 		return true
 	})
@@ -289,11 +296,28 @@ func (m *TimingWheelManager) RegisterKey(
 		m.onKeyExpired(keyRef.metadata, lapCounter)
 	})
 
-	m.registry.register(bucketId, keyHash, timer)
-
-	m.registeredKeys.Add(1)
+	replaced := m.registry.register(bucketId, keyHash, timer)
+	if !replaced {
+		m.registeredKeys.Add(1)
+	}
 
 	return true
+}
+
+// ApplyKeyExpiration is the single timing-wheel entry for creating, updating,
+// and cancelling a key's expiration schedule. A zero TTL cancels the current
+// schedule; a positive TTL creates or replaces it.
+func (m *TimingWheelManager) ApplyKeyExpiration(
+	bucketId uint64,
+	key []byte,
+	ds uint16,
+	ttl uint32,
+	timestamp uint64,
+) bool {
+	if ttl == Persistent {
+		return m.DeregisterKey(bucketId, key)
+	}
+	return m.RegisterKey(bucketId, key, ds, ttl, timestamp)
 }
 
 // DeregisterKey removes a key from the timing wheel.
@@ -363,11 +387,9 @@ func (m *TimingWheelManager) onKeyExpired(metadata keyMetadata, lapCounter uint3
 		}
 
 		wheelCoverage := m.slotDuration * time.Duration(m.wheelSize)
-
 		timer := m.wheel.AfterFunc(wheelCoverage, func() {
 			m.onKeyExpired(metadata, lapCounter-1)
 		})
-
 		m.registry.register(metadata.bucketId, metadata.keyHash, timer)
 		return
 	}

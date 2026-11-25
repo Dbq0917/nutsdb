@@ -838,7 +838,6 @@ func (db *DB) buildBTreeIdx(record *core.Record, entry *core.Entry) error {
 
 	if db.ttlService.IsExpired(record.TTL, record.Timestamp) || meta.Flag == DataDeleteFlag {
 		bTree.Delete(key)
-		db.ttlService.DeregisterKeyFromActiveExpiration(bucketId, key)
 	} else {
 		bTree.InsertRecord(record.Key, record)
 	}
@@ -868,35 +867,42 @@ func (db *DB) buildIdxes(record *core.Record, entry *core.Entry) error {
 		panic(fmt.Sprintf("there is an unexpected data structure that is unimplemented in our database.:%d", meta.Ds))
 	}
 
-	db.registerKeyForActiveExpiration(record, entry)
+	db.reconcileKeyExpiration(record, entry)
 
 	return nil
 }
 
-// registerKeyForActiveExpiration registers a key with TTL in the timing wheel for active expiration.
-func (db *DB) registerKeyForActiveExpiration(record *core.Record, entry *core.Entry) {
+// reconcileKeyExpiration is the single database-level entry for expiration
+// schedules. Positive TTL writes register or reschedule the key; persistent
+// writes, deletes, and already-expired records cancel any previous schedule.
+func (db *DB) reconcileKeyExpiration(record *core.Record, entry *core.Entry) {
 	if db.ttlService == nil {
 		return
 	}
 
 	meta := entry.Meta
+	ttl := meta.TTL
 
-	if meta.TTL > 0 && meta.Flag != DataDeleteFlag {
-		if db.ttlService.IsExpired(record.TTL, record.Timestamp) {
-			return
-		}
-
-		// Deregister old TTL before registering new one (handles TTL updates)
-		db.ttlService.DeregisterKeyFromActiveExpiration(meta.BucketId, entry.Key)
-
-		db.ttlService.RegisterKeyForActiveExpiration(
-			meta.BucketId,
-			entry.Key,
-			meta.Ds,
-			meta.TTL,
-			meta.Timestamp,
-		)
+	if meta.Flag == DataDeleteFlag || ttl == Persistent {
+		ttl = Persistent
+	} else if ttl > 0 && record != nil &&
+		db.ttlService.IsExpired(record.TTL, record.Timestamp) {
+		ttl = Persistent
 	}
+
+	db.ttlService.ApplyKeyExpiration(
+		meta.BucketId,
+		entry.Key,
+		meta.Ds,
+		ttl,
+		meta.Timestamp,
+	)
+}
+
+// registerKeyForActiveExpiration keeps the older recovery entry point name as
+// an alias for the unified reconciliation path.
+func (db *DB) registerKeyForActiveExpiration(record *core.Record, entry *core.Entry) {
+	db.reconcileKeyExpiration(record, entry)
 }
 
 // buildSetIdx builds set index when opening the DB.

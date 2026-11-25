@@ -184,6 +184,23 @@ func (s *Service) Name() string {
 	return "TTLService"
 }
 
+// ApplyKeyExpiration reconciles a key's active expiration schedule with the
+// supplied TTL. Positive TTL values create or replace the current schedule;
+// a zero TTL cancels it. This is the single entry point for registration,
+// rescheduling, and cancellation used by database write and recovery paths.
+func (s *Service) ApplyKeyExpiration(
+	bucketId uint64,
+	key []byte,
+	ds uint16,
+	ttl uint32,
+	timestamp uint64,
+) bool {
+	if s.wheelManager != nil {
+		return s.wheelManager.ApplyKeyExpiration(bucketId, key, ds, ttl, timestamp)
+	}
+	return false
+}
+
 // RegisterKeyForActiveExpiration registers a key in the timing wheel for active expiration.
 // Should be called when a key with TTL is written to the database.
 // If the timing wheel is disabled, this is a no-op.
@@ -194,16 +211,12 @@ func (s *Service) RegisterKeyForActiveExpiration(
 	ttl uint32,
 	timestamp uint64,
 ) {
-	if s.wheelManager != nil {
-		s.wheelManager.RegisterKey(bucketId, key, ds, ttl, timestamp)
-	}
+	s.ApplyKeyExpiration(bucketId, key, ds, ttl, timestamp)
 }
 
 // DeregisterKeyFromActiveExpiration removes a key from the timing wheel.
 // Should be called when a key is deleted before expiration or its TTL is updated.
 // If the timing wheel is disabled, this is a no-op.
 func (s *Service) DeregisterKeyFromActiveExpiration(bucketId uint64, key []byte) {
-	if s.wheelManager != nil {
-		s.wheelManager.DeregisterKey(bucketId, key)
-	}
+	s.ApplyKeyExpiration(bucketId, key, 0, Persistent, 0)
 }

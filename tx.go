@@ -285,7 +285,7 @@ func (tx *Tx) Commit() (err error) {
 	}
 	tx.db.RecordCount += curWriteCount
 
-	tx.registerKeysForActiveExpiration(records, pendingWriteList)
+	tx.reconcileKeyExpirations(records, pendingWriteList)
 
 	if err := tx.buildBucketInIndex(); err != nil {
 		return err
@@ -883,29 +883,22 @@ func (tx *Tx) getDeletedBuckets() (deletedBuckets map[core.BucketName]bool) {
 	return deletedBuckets
 }
 
-// registerKeysForActiveExpiration registers keys with TTL in the timing wheel for active expiration.
-func (tx *Tx) registerKeysForActiveExpiration(records []*core.Record, entries []*core.Entry) {
+// reconcileKeyExpirations applies the unified expiration schedule entry to
+// every committed write, including TTL updates, persistence, and deletion.
+func (tx *Tx) reconcileKeyExpirations(records []*core.Record, entries []*core.Entry) {
 	if tx.db.ttlService == nil {
 		return
 	}
 
 	for i, entry := range entries {
-		meta := entry.Meta
-
-		if meta.TTL > 0 && meta.Flag != DataDeleteFlag {
-			record := records[i]
-
-			if tx.db.ttlService.IsExpired(record.TTL, record.Timestamp) {
-				continue
-			}
-
-			tx.db.ttlService.RegisterKeyForActiveExpiration(
-				meta.BucketId,
-				entry.Key,
-				meta.Ds,
-				meta.TTL,
-				meta.Timestamp,
-			)
+		var record *core.Record
+		if i < len(records) {
+			record = records[i]
 		}
+		tx.db.reconcileKeyExpiration(record, entry)
 	}
+}
+
+func (tx *Tx) registerKeysForActiveExpiration(records []*core.Record, entries []*core.Entry) {
+	tx.reconcileKeyExpirations(records, entries)
 }
