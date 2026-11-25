@@ -202,6 +202,52 @@ func wmStartReceiver(t *testing.T, receiveChan <-chan *Message, expectBucket, ex
 	}()
 }
 
+// withTestWatchVars temporarily shrinks watch pipeline buffers so backpressure
+// engages without sending thousands of messages. The returned function restores
+// the original values and must be deferred.
+func withTestWatchVars(t *testing.T, overrides map[string]int64) func() {
+	t.Helper()
+
+	originals := map[string]int64{
+		"watchChanBufferSize":      int64(watchChanBufferSize),
+		"receiveChanBufferSize":    int64(receiveChanBufferSize),
+		"maxBatchSize":             int64(maxBatchSize),
+		"deadMessageThreshold":     int64(deadMessageThreshold),
+		"distributeChanBufferSize": int64(distributeChanBufferSize),
+		"victimBucketBufferSize":   int64(victimBucketBufferSize),
+	}
+
+	applyInt := func(name string, value int64) {
+		switch name {
+		case "watchChanBufferSize":
+			watchChanBufferSize = int(value)
+		case "receiveChanBufferSize":
+			receiveChanBufferSize = int(value)
+		case "maxBatchSize":
+			maxBatchSize = int(value)
+		case "deadMessageThreshold":
+			deadMessageThreshold = int(value)
+		case "distributeChanBufferSize":
+			distributeChanBufferSize = int(value)
+		case "victimBucketBufferSize":
+			victimBucketBufferSize = int(value)
+		}
+	}
+
+	for name, value := range overrides {
+		if _, ok := originals[name]; !ok {
+			t.Fatalf("unknown watch variable: %s", name)
+		}
+		applyInt(name, value)
+	}
+
+	return func() {
+		for name, value := range originals {
+			applyInt(name, value)
+		}
+	}
+}
+
 func TestWatchManager_SubscribeAndSendMessage(t *testing.T) {
 	t.Run("subscribe and send message", func(t *testing.T) {
 		wm := startDistributor(t)
@@ -218,31 +264,162 @@ func TestWatchManager_SubscribeAndSendMessage(t *testing.T) {
 		assert.Equal(t, value, msg.Value)
 	})
 
-	t.Run("subscribe and drop messages", func(t *testing.T) {
+	t.Run("permanently slow subscriber is evicted and the discard is accounted", func(t *testing.T) {
 		wm := startDistributor(t)
 		defer func() { _ = wm.close() }()
 
-		bucket := "bucket_test"
-		key := "key_test"
+		bucket := "bucket_evict"
+		key := "key_evict"
 
-		// Subscribe but don't receive messages
+		// Subscribe but never consume, so the subscriber stays permanently slow.
 		receiveChan, _ := wmSubscribe(t, wm, bucket, key)
 
-		// Send enough messages to:
-		// 1. Fill receiveChan buffer (1024)
-		// 2. Trigger 100+ drops to force-unsubscribe
-		// Total: 1100+ messages
-		messagesToSend := 1124
+		// Fill the receive buffer and keep the distributor retrying until the
+		// dead-message threshold trips and the safety valve evicts the consumer.
+		messagesToSend := receiveChanBufferSize + deadMessageThreshold + 64
 		wmSendMessages(t, wm, bucket, key, messagesToSend)
 
-		time.Sleep(100 * time.Millisecond)
+		assert.Eventually(t, func() bool {
+			return wm.Metrics().EvictedSubscribers == 1
+		}, 10*time.Second, 10*time.Millisecond, "slow subscriber should be force-unsubscribed")
+
 		drained := wmDrainChannel(t, receiveChan, 2*time.Second)
+		assert.Equal(t, receiveChanBufferSize, drained, "messages already buffered before eviction are preserved")
 
-		assert.Equal(t, 1024, drained, "should have buffered exactly 1024 messages")
+		// eviction must be observable through metrics, not a single log line
+		metrics := wm.Metrics()
+		assert.Equal(t, int64(1), metrics.EvictedSubscribers)
+		assert.GreaterOrEqual(t, metrics.EvictedMessages, int64(1))
 
-		// Verify subscriber was force-unsubscribed due to slow consumption
 		wmVerifySubscriberRemoved(t, wm, bucket, key)
 		wmVerifyBucketRemoved(t, wm, bucket)
+	})
+
+	t.Run("temporarily slow subscriber loses no messages under backpressure", func(t *testing.T) {
+		// small buffers so backpressure engages quickly
+		restoreWatchVars := withTestWatchVars(t, map[string]int64{
+			"watchChanBufferSize":      32,
+			"distributeChanBufferSize": 4,
+			"receiveChanBufferSize":    16,
+		})
+		defer restoreWatchVars()
+
+		wm := startDistributor(t)
+		defer func() { _ = wm.close() }()
+
+		bucket := "bucket_backpressure"
+		key := "key_backpressure"
+		totalMessages := 400
+
+		receiveChan, _ := wmSubscribe(t, wm, bucket, key)
+
+		// the consumer starts slow: let the producer get well ahead of it
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			for range receiveChan {
+			}
+		}()
+
+		sendDone := make(chan struct{})
+		sendRejected := 0
+		go func() {
+			defer close(sendDone)
+			for i := 0; i < totalMessages; i++ {
+				message := NewMessage(bucket, key, []byte(fmt.Sprintf("value_%d", i)), DataSetFlag, uint64(time.Now().Unix()))
+				if err := wm.sendMessage(message); err != nil {
+					// writes are never blocked: a saturated pipeline answers
+					// immediately with an observable, countable rejection
+					assert.ErrorIs(t, err, ErrWatchChanCannotSend)
+					sendRejected++
+				}
+			}
+		}()
+
+		select {
+		case <-sendDone:
+		case <-time.After(15 * time.Second):
+			t.Fatal("backpressure must not stall the write path forever")
+		}
+
+		// accounting invariant: every accepted message is either delivered or
+		// explicitly accounted for; nothing disappears behind a single log line
+		assert.Eventually(t, func() bool {
+			snapshot := wm.Metrics()
+			return snapshot.DeliveredMessages == snapshot.AcceptedMessages
+		}, 10*time.Second, 10*time.Millisecond,
+			"every accepted message must reach the recovered slow subscriber")
+
+		metrics := wm.Metrics()
+		assert.Equal(t, int64(sendRejected), metrics.RejectedMessages)
+		assert.Equal(t, int64(totalMessages)-int64(sendRejected), metrics.AcceptedMessages)
+		assert.Zero(t, metrics.EvictedSubscribers, "a consumer that catches up must not be evicted")
+		assert.Zero(t, metrics.DroppedMessages, "no batch may be dropped in steady state")
+	})
+
+	t.Run("messages of the same key keep sequence order through backpressure", func(t *testing.T) {
+		restoreWatchVars := withTestWatchVars(t, map[string]int64{
+			"watchChanBufferSize":      32,
+			"distributeChanBufferSize": 4,
+			"receiveChanBufferSize":    8,
+		})
+		defer restoreWatchVars()
+
+		wm := startDistributor(t)
+		defer func() { _ = wm.close() }()
+
+		bucket := "bucket_order"
+		key := "key_order"
+		totalMessages := 200
+
+		receiveChan, _ := wmSubscribe(t, wm, bucket, key)
+
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			for range receiveChan {
+			}
+		}()
+
+		sendDone := make(chan struct{})
+		go func() {
+			defer close(sendDone)
+			for i := 0; i < totalMessages; i++ {
+				message := NewMessage(bucket, key, []byte(fmt.Sprintf("value_%d", i)), DataSetFlag, uint64(time.Now().Unix()))
+				_ = wm.sendMessage(message)
+			}
+		}()
+
+		var lastSeq uint64
+		received := 0
+		select {
+		case <-sendDone:
+		case <-time.After(15 * time.Second):
+			t.Fatal("backpressure must not stall the write path forever")
+		}
+
+		expected := int(wm.Metrics().AcceptedMessages)
+		assert.Greater(t, expected, 0)
+		for received < expected {
+			select {
+			case msg, ok := <-receiveChan:
+				if !ok {
+					t.Fatalf("channel closed after %d/%d messages", received, expected)
+				}
+				if msg.Seq <= lastSeq {
+					t.Fatalf("out-of-order message: seq=%d after %d", msg.Seq, lastSeq)
+				}
+				lastSeq = msg.Seq
+				received++
+			case <-time.After(10 * time.Second):
+				t.Fatalf("timeout after %d/%d messages", received, expected)
+			}
+		}
+
+		// writes rejected at ingress never entered the pipeline; every message
+		// that did enter must have been delivered, in strictly increasing Seq
+		metrics := wm.Metrics()
+		assert.Equal(t, metrics.AcceptedMessages, metrics.DeliveredMessages)
+		assert.Equal(t, expected, received,
+			"every accepted message must be delivered, in sequence order")
 	})
 
 	t.Run("multiple subscribers for the same key", func(t *testing.T) {
@@ -579,7 +756,7 @@ func TestWatchManager_StartDistributor(t *testing.T) {
 		}
 
 		received := wmReceiveMessages(t, receiveChan, bucket, key, totalMessages, 3*time.Second)
-		assert.Equal(t, maxBatchSize, received, "should receive full batch immediately")
+		assert.Equal(t, totalMessages, received, "both batches must be delivered, no batch dropped")
 
 		_ = wm.close()
 	})
@@ -639,11 +816,16 @@ func TestWatchManager_StartDistributor(t *testing.T) {
 		wmVerifyBucketRemoved(t, wm, bucket)
 	})
 
-	//TODO: This test will be fail because the channel of a subscriber is only 1024. then the rest of the messages will be dropped.
-	// we need to fix this with plan for handling the dropped messages in the future.
+	// Backpressure guarantees that an active consumer loses nothing even when
+	// the producer far outruns every channel buffer along the pipeline.
 	t.Run("send messages with large number of messages over max watch channel buffer size", func(t *testing.T) {
-		watchChanBufferSize = 124   // Change the watch channel buffer size to 124 for testing
-		receiveChanBufferSize = 124 // Change the receive channel buffer size to 124 for testing
+		restoreWatchVars := withTestWatchVars(t, map[string]int64{
+			"watchChanBufferSize":      124,
+			"receiveChanBufferSize":    124,
+			"distributeChanBufferSize": 16,
+		})
+		defer restoreWatchVars()
+
 		wm := startDistributor(t)
 		defer func() { _ = wm.close() }()
 		time.Sleep(50 * time.Millisecond)
@@ -651,12 +833,22 @@ func TestWatchManager_StartDistributor(t *testing.T) {
 		bucket := "test_bucket"
 		key := "test_key"
 		receiveChan, _ := wmSubscribe(t, wm, bucket, key)
-		totalMessages := 10 * 1024
+		totalMessages := 2048
 		sendingDone := make(chan struct{})
 		receivingDone := make(chan struct{})
-		countOfSent := 0
+		sendRejected := 0
 
-		// send a large number of messages to the watch channel
+		// a consumer that keeps draining the whole time; it receives every
+		// message the pipeline accepts, never fewer
+		go func() {
+			defer close(receivingDone)
+			for range receiveChan {
+			}
+		}()
+
+		// send a large number of messages to the watch channel; when the tiny
+		// ingress buffer saturates, writes get an immediate error instead of
+		// blocking, and each rejection is accounted
 		go func() {
 			defer close(sendingDone)
 
@@ -665,26 +857,29 @@ func TestWatchManager_StartDistributor(t *testing.T) {
 				message := NewMessage(bucket, key, value, DataSetFlag, uint64(time.Now().Unix()))
 				err := wm.sendMessage(message)
 				if err != nil {
-					t.Logf("channel buffer is full, send message error: %+v", err)
-					assert.EqualError(t, err, ErrWatchChanCannotSend.Error())
+					assert.ErrorIs(t, err, ErrWatchChanCannotSend)
+					sendRejected++
 				}
-				countOfSent++
 			}
-
-			assert.Equal(t, countOfSent, totalMessages, "should send all messages")
-		}()
-
-		// receive messages from the subscriber
-		// expect there are some messages dropped
-		go func() {
-			defer close(receivingDone)
-			receivedCount := wmReceiveMessages(t, receiveChan, bucket, key, totalMessages, 10*time.Second)
-			assert.GreaterOrEqual(t, totalMessages, receivedCount, "should receive less than or equal to total messages")
 		}()
 
 		<-sendingDone
-		<-receivingDone
+
+		metrics := wm.Metrics()
+		assert.Eventually(t, func() bool {
+			return wm.Metrics().DeliveredMessages == wm.Metrics().AcceptedMessages
+		}, 10*time.Second, 10*time.Millisecond)
+
+		metrics = wm.Metrics()
+		assert.Equal(t, int64(totalMessages), metrics.AcceptedMessages+metrics.RejectedMessages,
+			"every write must be either accepted or explicitly rejected")
+		assert.Equal(t, int64(sendRejected), metrics.RejectedMessages)
+		assert.Equal(t, metrics.AcceptedMessages, metrics.DeliveredMessages,
+			"active subscriber must not lose any accepted message")
+		assert.Zero(t, metrics.EvictedSubscribers)
+		assert.Zero(t, metrics.DroppedMessages)
 		_ = wm.close()
+		<-receivingDone
 	})
 
 	t.Run("sendMessage returns ErrWatchManagerClosed when worker context is done", func(t *testing.T) {
@@ -1142,5 +1337,83 @@ func TestWatchManager_Stop(t *testing.T) {
 		// Second stop should return error
 		err = wm.Stop(2 * time.Second)
 		assert.ErrorIs(t, err, ErrWatchManagerClosed)
+	})
+}
+
+func TestWatchManager_Metrics(t *testing.T) {
+	t.Run("healthy pipeline reports zero loss and full accounting", func(t *testing.T) {
+		wm := startDistributor(t)
+		defer func() { _ = wm.close() }()
+
+		bucket := "metrics_bucket"
+		key := "metrics_key"
+		receiveChan, _ := wmSubscribe(t, wm, bucket, key)
+
+		const messageCount = 50
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for range receiveChan {
+			}
+		}()
+
+		wmSendMessages(t, wm, bucket, key, messageCount)
+
+		assert.Eventually(t, func() bool {
+			return wm.Metrics().DeliveredMessages == messageCount
+		}, 5*time.Second, 10*time.Millisecond)
+
+		metrics := wm.Metrics()
+		assert.Equal(t, int64(messageCount), metrics.AcceptedMessages)
+		assert.Equal(t, int64(messageCount), metrics.DeliveredMessages)
+		assert.Zero(t, metrics.RejectedMessages)
+		assert.Zero(t, metrics.DroppedBatches)
+		assert.Zero(t, metrics.DroppedMessages)
+		assert.Zero(t, metrics.EvictedSubscribers)
+		assert.Zero(t, metrics.EvictedMessages)
+
+		_ = wm.close()
+		<-done
+	})
+
+	t.Run("ingress rejection is counted without blocking", func(t *testing.T) {
+		wm := NewWatchManager() // not started: watchChan never drains
+
+		for i := 0; i < watchChanBufferSize; i++ {
+			require.NoError(t, wm.sendMessage(NewMessage(
+				"bucket", "key", []byte("value"), DataSetFlag, uint64(time.Now().Unix()))))
+		}
+
+		err := wm.sendMessage(NewMessage(
+			"bucket", "key", []byte("overflow"), DataSetFlag, uint64(time.Now().Unix())))
+		require.ErrorIs(t, err, ErrWatchChanCannotSend)
+
+		metrics := wm.Metrics()
+		assert.Equal(t, int64(watchChanBufferSize), metrics.AcceptedMessages)
+		assert.Equal(t, int64(1), metrics.RejectedMessages)
+		assert.Zero(t, metrics.DeliveredMessages)
+	})
+
+	t.Run("metrics remain readable after shutdown", func(t *testing.T) {
+		wm := NewWatchManager()
+		require.NoError(t, wm.Start(context.Background()))
+
+		sent := 0
+		for i := 0; i < watchChanBufferSize; i++ {
+			if err := wm.sendMessage(NewMessage(
+				"bucket", "key", []byte("value"), DataSetFlag, uint64(time.Now().Unix()))); err == nil {
+				sent++
+			}
+		}
+
+		require.NoError(t, wm.Stop(5*time.Second))
+
+		metrics := wm.Metrics()
+		assert.Equal(t, int64(sent), metrics.AcceptedMessages)
+		assert.Equal(t, int64(0), metrics.EvictedSubscribers)
+		if metrics.DroppedBatches > 0 {
+			assert.Greater(t, metrics.DroppedMessages, int64(0),
+				"dropped batches must also report the discarded message count")
+		}
 	})
 }

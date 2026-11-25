@@ -3415,6 +3415,92 @@ func TestDB_Watch(t *testing.T) {
 	})
 }
 
+// TestDB_WatchBackpressure verifies the watch pipeline backpressure contract
+// against the real write path:
+//   - a deliberately slow subscriber builds up a backlog;
+//   - writes are never blocked by the slow subscriber;
+//   - every event accepted by the pipeline is delivered, in key order;
+//   - every accepted/rejected/delivered event is accounted in the metrics.
+func TestDB_WatchBackpressure(t *testing.T) {
+	restoreWatchVars := withTestWatchVars(t, map[string]int64{
+		"watchChanBufferSize":      32,
+		"distributeChanBufferSize": 4,
+		"receiveChanBufferSize":    16,
+	})
+	defer restoreWatchVars()
+
+	runNutsDBTestWithWatch(t, func(t *testing.T, db *DB) {
+		bucket := "bucket_backpressure"
+		key := testutils.GetTestBytes(0)
+		txCreateBucket(t, db, DataStructureBTree, bucket, nil)
+
+		subscriber, err := db.watchMgr.subscribe(bucket, string(key))
+		require.NoError(t, err)
+
+		// slow consumer: sleep before each receive to guarantee a backlog forms
+		var received atomic.Int64
+		var lastSeq atomic.Uint64
+		consumerDone := make(chan struct{})
+		go func() {
+			defer close(consumerDone)
+			for msg := range subscriber.receiveChan {
+				time.Sleep(2 * time.Millisecond)
+				if msg.Seq <= lastSeq.Load() {
+					assert.Failf(t, "out-of-order message", "seq=%d last=%d", msg.Seq, lastSeq.Load())
+					return
+				}
+				lastSeq.Store(msg.Seq)
+				received.Add(1)
+			}
+		}()
+
+		// producers keep writing while the consumer is slow; time each write to
+		// prove the watch pipeline never drags the write path behind it
+		totalWrites := 200
+		var maxWriteNanos atomic.Int64
+		for i := 0; i < totalWrites; i++ {
+			start := time.Now()
+			txPut(t, db, bucket, key, []byte(fmt.Sprintf("value_%d", i)), Persistent, nil, nil)
+			elapsed := time.Since(start).Nanoseconds()
+			for {
+				prev := maxWriteNanos.Load()
+				if elapsed <= prev || maxWriteNanos.CompareAndSwap(prev, elapsed) {
+					break
+				}
+			}
+		}
+
+		// even under a saturated pipeline, a single Put must return promptly
+		assert.Less(t, time.Duration(maxWriteNanos.Load()), time.Second,
+			"slow subscriber must not block writes")
+
+		metrics, err := db.GetWatchMetrics()
+		require.NoError(t, err)
+
+		// writes are either accepted into the pipeline or immediately rejected;
+		// nothing is silently dropped, so the totals always reconcile
+		assert.Equal(t, int64(totalWrites), metrics.AcceptedMessages+metrics.RejectedMessages)
+
+		assert.Eventually(t, func() bool {
+			snapshot, mErr := db.GetWatchMetrics()
+			return mErr == nil && snapshot.DeliveredMessages == snapshot.AcceptedMessages
+		}, 5*time.Second, 10*time.Millisecond,
+			"every accepted event must reach the slow subscriber")
+
+		finalMetrics, err := db.GetWatchMetrics()
+		require.NoError(t, err)
+		assert.Equal(t, finalMetrics.AcceptedMessages, finalMetrics.DeliveredMessages,
+			"sent and received counts must reconcile for the event stream")
+		assert.Zero(t, finalMetrics.EvictedSubscribers, "a consumer that keeps draining is not evicted")
+		assert.Zero(t, finalMetrics.DroppedMessages, "no batch is dropped in steady state")
+
+		require.NoError(t, db.watchMgr.unsubscribe(bucket, string(key), subscriber.id))
+		<-consumerDone
+		assert.Equal(t, finalMetrics.AcceptedMessages, received.Load(),
+			"the slow subscriber consumed every accepted event")
+	})
+}
+
 func TestDB_WatchTTL(t *testing.T) {
 	t.Run("db watch and ttl", func(t *testing.T) {
 		var err error

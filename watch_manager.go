@@ -34,6 +34,9 @@ var (
 	deadMessageThreshold     = 100
 	distributeChanBufferSize = 128
 	victimBucketBufferSize   = 128
+	// slowSubscriberRetryInterval is how long the distributor waits between
+	// delivery attempts when a subscriber channel is full.
+	slowSubscriberRetryInterval = 5 * time.Millisecond
 )
 
 const (
@@ -67,7 +70,33 @@ type Message struct {
 	Value      []byte
 	Flag       DataFlag
 	Timestamp  uint64
-	priority   MessagePriority
+	// Seq is a globally monotonic sequence number assigned when the message
+	// enters the watch manager. It lets subscribers detect gaps after the
+	// backpressure safety valve evicts a slow consumer.
+	Seq      uint64
+	priority MessagePriority
+}
+
+// WatchMetrics exposes counters describing how the watch pipeline applies
+// backpressure. Every counter is safe to read concurrently.
+type WatchMetrics struct {
+	// AcceptedMessages counts messages successfully enqueued into the pipeline.
+	AcceptedMessages int64
+	// DeliveredMessages counts messages pushed into a subscriber channel.
+	DeliveredMessages int64
+	// RejectedMessages counts messages refused at ingress because the watch
+	// channel was full; the corresponding write receives an error instead of
+	// a silent success.
+	RejectedMessages int64
+	// DroppedBatches and DroppedMessages count batches (and their messages)
+	// discarded by the collector while the manager is shutting down.
+	DroppedBatches  int64
+	DroppedMessages int64
+	// EvictedSubscribers counts slow subscribers force-unsubscribed after
+	// their channels stayed full across deadMessageThreshold attempts.
+	EvictedSubscribers int64
+	// EvictedMessages counts messages discarded when a subscriber was evicted.
+	EvictedMessages int64
 }
 
 func NewMessage(bucketName core.BucketName, key string, value []byte, flag DataFlag, timestamp uint64, options ...MessageOptions) *Message {
@@ -119,6 +148,18 @@ type watchManager struct {
 	workerCancel   context.CancelFunc
 	wg             sync.WaitGroup
 
+	// sequence generator for messages accepted by the pipeline
+	seqGenerator atomic.Uint64
+
+	// backpressure counters, see WatchMetrics for their meaning
+	acceptedMessages   atomic.Int64
+	deliveredMessages  atomic.Int64
+	rejectedMessages   atomic.Int64
+	droppedBatches     atomic.Int64
+	droppedMessages    atomic.Int64
+	evictedSubscribers atomic.Int64
+	evictedMessages    atomic.Int64
+
 	closed      bool
 	started     bool // indicates whether Start() has been called
 	idGenerator *IDGenerator
@@ -145,6 +186,20 @@ func NewWatchManager() *watchManager {
 	}
 }
 
+// Metrics returns a point-in-time snapshot of the watch pipeline counters.
+// It can be called at any time, including after the manager is closed.
+func (wm *watchManager) Metrics() WatchMetrics {
+	return WatchMetrics{
+		AcceptedMessages:   wm.acceptedMessages.Load(),
+		DeliveredMessages:  wm.deliveredMessages.Load(),
+		RejectedMessages:   wm.rejectedMessages.Load(),
+		DroppedBatches:     wm.droppedBatches.Load(),
+		DroppedMessages:    wm.droppedMessages.Load(),
+		EvictedSubscribers: wm.evictedSubscribers.Load(),
+		EvictedMessages:    wm.evictedMessages.Load(),
+	}
+}
+
 // Name returns the component name
 func (wm *watchManager) Name() string {
 	return "WatchManager"
@@ -156,11 +211,17 @@ func (wm *watchManager) sendMessage(message *Message) error {
 		return ErrWatchManagerClosed
 	}
 
+	// assign the sequence before enqueuing so a worker that picks the message
+	// up immediately never observes an unset Seq (avoids a data race)
+	message.Seq = wm.seqGenerator.Add(1)
+
 	// the high priority messages must be ensured to push to the watch channel
 	if message.priority == MessagePriorityHigh {
 		select {
 		case wm.watchChan <- message:
+			wm.acceptedMessages.Add(1)
 			utils.GetLogger().Printf("[watch_manager] Sent high priority message %s/%s to watch channel\n", message.BucketName, message.Key)
+			return nil
 		case <-wm.workerCtx.Done():
 			return ErrWatchManagerClosed
 		}
@@ -168,10 +229,12 @@ func (wm *watchManager) sendMessage(message *Message) error {
 
 	select {
 	case wm.watchChan <- message:
+		wm.acceptedMessages.Add(1)
 		return nil
 	case <-wm.workerCtx.Done():
 		return ErrWatchManagerClosed
 	default:
+		wm.rejectedMessages.Add(1)
 		return ErrWatchChanCannotSend
 	}
 }
@@ -254,6 +317,8 @@ func (wm *watchManager) runCollector() {
 			case wm.distributeChan <- batches:
 			default:
 				utils.GetLogger().Printf("[watch_manager] Dropping final batch of %d messages\n", len(batches))
+				wm.droppedBatches.Add(1)
+				wm.droppedMessages.Add(int64(len(batches)))
 			}
 		}
 
@@ -265,11 +330,18 @@ func (wm *watchManager) runCollector() {
 		sendBatch := make([]*Message, len(batch))
 		copy(sendBatch, batch)
 
+		// Backpressure: instead of silently dropping the whole batch when the
+		// distribution channel is full, wait until the distributor makes room.
+		// The collector is an internal worker, so blocking here only applies
+		// backpressure to the watch pipeline; write callers still get immediate
+		// answers from the buffered watch channel and are never blocked.
+		// The only drop path is shutdown, when the worker context is cancelled.
 		select {
 		case wm.distributeChan <- sendBatch:
 		case <-wm.workerCtx.Done():
-		default:
-			utils.GetLogger().Printf("[watch_manager] Distribution channel full, dropping batch of %d messages\n", len(sendBatch))
+			utils.GetLogger().Printf("[watch_manager] Dropping batch of %d messages while shutting down\n", len(sendBatch))
+			wm.droppedBatches.Add(1)
+			wm.droppedMessages.Add(int64(len(sendBatch)))
 		}
 	}
 
@@ -390,25 +462,6 @@ func (wm *watchManager) distributeAllMessages(messages []*Message) error {
 		return nil
 	}
 
-	dropMessage := func(message *Message, subscriber *subscriber) {
-		utils.GetLogger().Printf("[watch_manager] Force-unsubscribing slow subscriber with id %d for message %s/%s\n",
-			subscriber.id, message.BucketName, message.Key)
-
-		if _, err := wm.findSubscriber(message.BucketName, message.Key, subscriber.id); err == nil {
-			delete(wm.lookup[message.BucketName][message.Key], subscriber.id)
-			if len(wm.lookup[message.BucketName][message.Key]) == 0 {
-				delete(wm.lookup[message.BucketName], message.Key)
-			}
-			if len(wm.lookup[message.BucketName]) == 0 {
-				delete(wm.lookup, message.BucketName)
-			}
-			if subscriber.active.Load() {
-				close(subscriber.receiveChan)
-				subscriber.active.Store(false)
-			}
-		}
-	}
-
 	for _, message := range messages {
 		bucketMap, ok := wm.lookup[message.BucketName]
 		if !ok {
@@ -427,27 +480,77 @@ func (wm *watchManager) distributeAllMessages(messages []*Message) error {
 			continue
 		}
 
-		// avoid blocking the distributor, all messages blocked will be dropped
 		for _, subscriber := range subscriberMap {
 			if !subscriber.active.Load() {
 				utils.GetLogger().Printf("[watch_manager] Skipping inactive subscriber with id %d for message %s/%s\n", subscriber.id, message.BucketName, message.Key)
 				continue
 			}
 
-			select {
-			case subscriber.receiveChan <- message:
-				subscriber.deadMessages = 0
-			default:
-				// when the messages are not pushed to dropChan, we consider it as dead
-				subscriber.deadMessages++
-				if subscriber.deadMessages >= deadMessageThreshold {
-					dropMessage(message, subscriber)
-				}
-			}
+			wm.deliverToSubscriber(message, subscriber)
 		}
 	}
 
 	return nil
+}
+
+// deliverToSubscriber pushes a message to one subscriber, applying backpressure
+// instead of dropping on the first full channel:
+//   - when the channel has room, the message is delivered immediately;
+//   - when it is full, the distributor waits slowSubscriberRetryInterval and
+//     retries, so a temporarily slow consumer does not lose events and the
+//     messages of a key keep arriving in sequence order;
+//   - when the channel stays full across deadMessageThreshold attempts, the
+//     subscriber is considered permanently stuck and evicted. This safety
+//     valve bounds how long one slow consumer can stall the pipeline (and
+//     indirectly the write path); the eviction is logged and accounted in
+//     metrics rather than hiding behind a single log line.
+func (wm *watchManager) deliverToSubscriber(message *Message, subscriber *subscriber) {
+	for {
+		select {
+		case subscriber.receiveChan <- message:
+			subscriber.deadMessages = 0
+			wm.deliveredMessages.Add(1)
+			return
+		default:
+		}
+
+		subscriber.deadMessages++
+		if subscriber.deadMessages >= deadMessageThreshold {
+			wm.evictSubscriber(message, subscriber)
+			return
+		}
+
+		select {
+		case <-wm.workerCtx.Done():
+			// shutting down; cleanUpSubscribers closes the channel
+			return
+		case <-time.After(slowSubscriberRetryInterval):
+		}
+	}
+}
+
+// evictSubscriber removes a permanently stuck subscriber and records the
+// discarded message in the backpressure counters.
+func (wm *watchManager) evictSubscriber(message *Message, subscriber *subscriber) {
+	utils.GetLogger().Printf("[watch_manager] Force-unsubscribing slow subscriber with id %d after %d full-channel attempts, dropping message seq=%d %s/%s\n",
+		subscriber.id, subscriber.deadMessages, message.Seq, message.BucketName, message.Key)
+
+	if _, err := wm.findSubscriber(message.BucketName, message.Key, subscriber.id); err == nil {
+		delete(wm.lookup[message.BucketName][message.Key], subscriber.id)
+		if len(wm.lookup[message.BucketName][message.Key]) == 0 {
+			delete(wm.lookup[message.BucketName], message.Key)
+		}
+		if len(wm.lookup[message.BucketName]) == 0 {
+			delete(wm.lookup, message.BucketName)
+		}
+		if subscriber.active.Load() {
+			close(subscriber.receiveChan)
+			subscriber.active.Store(false)
+		}
+	}
+
+	wm.evictedSubscribers.Add(1)
+	wm.evictedMessages.Add(1)
 }
 
 // subscribe to the key and bucket

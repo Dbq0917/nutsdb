@@ -9,7 +9,10 @@ NutsDB provides a **Watch** feature that enables real-time monitoring of key cha
 
 - **Universal Support**: Watch a key once, and it applies to all data structure buckets with that name.
 - **Graceful Shutdown**: The watch function guarantees that all pending messages in the pipeline are processed before returning, ensuring no data loss during shutdown.
-- **High Performance**: Uses a buffered channel design to ensure the database performance is not impacted by slow watchers.
+- **Backpressure, Not Silent Drops**: A slow subscriber applies backpressure inside the watch pipeline instead of losing whole batches. Writes are never blocked; when ingress is saturated a write receives an explicit, countable `ErrWatchChanCannotSend`.
+- **Observable Discards**: Accepted, delivered, rejected, dropped and evicted events are all exposed via `db.GetWatchMetrics()`, so downstream incremental sync can always reconcile its accounts.
+- **Ordered by Key**: Each `Message` carries a globally monotonic `Seq`; messages for the same key are delivered in sequence order, and a gap in `Seq` reveals that a slow subscriber was evicted.
+- **High Performance**: Uses a buffered channel design so ordinary load never impacts write latency.
 
 ## Use Cases
 
@@ -245,12 +248,55 @@ For those interested in the internal architecture:
    - **Collector**: Batches incoming messages (up to 1024) from watchChan
    - **Distributor**: Routes batched messages to subscribers and identifies bucket deletions
    - **Victim Collector**: Asynchronously handles bucket deletion notifications and subscriber cleanup
-2. **Large Buffers**: 1024-message buffers minimize drop rates even under high load
+2. **Large Buffers**: 1024-message buffers absorb short bursts without engaging backpressure
 3. **Batching**: Processes messages in batches (up to 1024) for better throughput
-4. **Non-Blocking Sends**: Prevents slow subscribers from blocking the entire system
+4. **Backpressure with a Safety Valve**: When a subscriber channel is full, the distributor waits and retries instead of discarding messages; if the channel stays full across `deadMessageThreshold` (100) attempts, the permanently stuck subscriber is force-unsubscribed so it cannot stall the pipeline indefinitely. The eviction is logged with the message `Seq` and counted in the metrics.
 5. **Bucket Deletion Handling**: When a bucket is deleted, all affected subscribers receive a deletion notification and are gracefully shut down via the victimChan pipeline
 
 This architecture ensures high performance and reliability even under heavy load.
+
+### Backpressure and Message Accounting
+
+The pipeline never silently drops an accepted batch. Backpressure flows through
+the internal goroutines only, keeping the write path non-blocking:
+
+1. The collector waits for room in `distributeChan` instead of dropping a full
+   batch. The only collector-side drop happens while the manager is shutting
+   down, and it is counted as `DroppedBatches`/`DroppedMessages`.
+2. The distributor retries a full subscriber channel every
+   `slowSubscriberRetryInterval` (5ms). A subscriber that merely slows down
+   temporarily therefore loses no events and still sees them in `Seq` order.
+3. A subscriber whose channel stays full for 100 consecutive attempts is
+   evicted. Its channel is closed, `EvictedSubscribers` and `EvictedMessages`
+   are incremented, and the log line records the discarded message's `Seq`.
+4. When the ingress `watchChan` itself is saturated, `sendMessage` returns
+   `ErrWatchChanCannotSend` immediately and increments `RejectedMessages`,
+   rather than blocking the write or reporting a false success.
+
+Read the counters at any time:
+
+```go
+metrics, err := db.GetWatchMetrics()
+if err != nil {
+    // watch feature is disabled
+    return err
+}
+fmt.Printf("accepted=%d delivered=%d rejected=%d evicted=%d dropped=%d\n",
+    metrics.AcceptedMessages, metrics.DeliveredMessages,
+    metrics.RejectedMessages, metrics.EvictedSubscribers,
+    metrics.DroppedMessages)
+```
+
+The steady-state accounting invariant is:
+
+```
+AcceptedMessages + RejectedMessages == writes attempted
+AcceptedMessages == DeliveredMessages   (unless a subscriber was evicted)
+```
+
+A downstream consumer doing incremental sync can store the last seen
+`Message.Seq`; a non-contiguous jump means events for that key were lost to an
+eviction and a resync is required.
 ### Important Notes
 
 1. **Cross-Data Structure**: Watching a key works regardless of the data structure (BTree, List, Set, etc.). A change in any data structure for that bucket/key will trigger the callback.
@@ -262,7 +308,6 @@ This architecture ensures high performance and reliability even under heavy load
 
 | Feature | Description |
 |---------|-------------|
-| **Robust Message Handling** | Implement robust mechanism to ensure consistency, correct ordering of missing messages, and reliable synchronization among subscribers. |
 | **Prefix Watch** | Support watching keys by prefix pattern. |
 | **Range Key Watch** | Support watching a range of keys (startKey to endKey). |
 | **Sharded Watcher** | Shard the watcher implementation by data structure type for better scalability. |

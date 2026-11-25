@@ -1332,3 +1332,14 @@ func (db *DB) Watch(ctx context.Context, bucket string, key []byte, cb func(mess
 
 	return watcher, nil
 }
+
+// GetWatchMetrics returns a snapshot of the watch pipeline backpressure
+// counters (accepted, delivered, rejected and dropped/evicted events).
+// It returns an error when the watch feature is disabled.
+func (db *DB) GetWatchMetrics() (WatchMetrics, error) {
+	if db.watchMgr == nil {
+		return WatchMetrics{}, ErrWatchFeatureDisabled
+	}
+
+	return db.watchMgr.Metrics(), nil
+}
