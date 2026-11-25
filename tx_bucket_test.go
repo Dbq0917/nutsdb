@@ -74,6 +74,59 @@ func TestBucket_IterateBuckets(t *testing.T) {
 			return true
 		}, nil)
 		assert.Equal(t, false, matched)
+
+		// delete a bucket in the middle, the remaining buckets should still
+		// be iterated in the same order as before the deletion
+		orderedBuckets := []string{"set_bucket_1", "set_bucket_2", "set_bucket_3", "set_bucket_4", "set_bucket_5"}
+		for _, name := range orderedBuckets {
+			txCreateBucket(t, db, DataStructureSet, name, nil)
+		}
+
+		deletedId, err := db.bucketMgr.GetBucketID(DataStructureSet, "set_bucket_3")
+		assert.NoError(t, err)
+		txDeleteBucket(t, db, DataStructureSet, "set_bucket_3", nil)
+
+		// the deleted bucket id should be removed from the index as well
+		_, exist := db.Index.Set.Idx[deletedId]
+		assert.False(t, exist)
+
+		var iterated []string
+		err = db.View(func(tx *Tx) error {
+			return tx.IterateBuckets(DataStructureSet, "set_bucket_*", func(bucket string) bool {
+				iterated = append(iterated, bucket)
+				return true
+			})
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"set_bucket_1", "set_bucket_2", "set_bucket_4", "set_bucket_5"}, iterated)
+	})
+}
+
+func TestBucket_IterateBucketsWithStaleBucketId(t *testing.T) {
+	runNutsDBTest(t, nil, func(t *testing.T, db *DB) {
+		orderedBuckets := []string{"set_bucket_1", "set_bucket_2", "set_bucket_3"}
+		for _, name := range orderedBuckets {
+			txCreateBucket(t, db, DataStructureSet, name, nil)
+		}
+
+		// delete the middle bucket, then put its id back into the index to
+		// simulate a stale index entry whose bucket metadata is already gone
+		deletedId, err := db.bucketMgr.GetBucketID(DataStructureSet, "set_bucket_2")
+		assert.NoError(t, err)
+		txDeleteBucket(t, db, DataStructureSet, "set_bucket_2", nil)
+		db.Index.Set.GetWithDefault(deletedId)
+
+		// the stale bucket id should be skipped without aborting the iteration,
+		// and the buckets after it should still be visited in order
+		var iterated []string
+		err = db.View(func(tx *Tx) error {
+			return tx.IterateBuckets(DataStructureSet, "set_bucket_*", func(bucket string) bool {
+				iterated = append(iterated, bucket)
+				return true
+			})
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"set_bucket_1", "set_bucket_3"}, iterated)
 	})
 }
 

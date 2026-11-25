@@ -15,6 +15,9 @@
 package nutsdb
 
 import (
+	"errors"
+	"sort"
+
 	"github.com/nutsdb/nutsdb/internal/core"
 	"github.com/nutsdb/nutsdb/internal/utils"
 )
@@ -25,51 +28,49 @@ func (tx *Tx) IterateBuckets(ds uint16, pattern string, f func(bucket string) bo
 		return err
 	}
 
+	var bucketIds []core.BucketId
 	if ds == DataStructureSet {
-		for bucketId := range tx.db.Index.Set.Idx {
-			bucket, err := tx.db.bucketMgr.GetBucketById(uint64(bucketId))
-			if err != nil {
-				return err
-			}
-			if end, err := utils.MatchForRange(pattern, bucket.Name, f); end || err != nil {
-				return err
-			}
-		}
+		bucketIds = sortedBucketIds(tx.db.Index.Set.Idx)
 	}
 	if ds == DataStructureSortedSet {
-		for bucketId := range tx.db.Index.SortedSet.Idx {
-			bucket, err := tx.db.bucketMgr.GetBucketById(uint64(bucketId))
-			if err != nil {
-				return err
-			}
-			if end, err := utils.MatchForRange(pattern, bucket.Name, f); end || err != nil {
-				return err
-			}
-		}
+		bucketIds = sortedBucketIds(tx.db.Index.SortedSet.Idx)
 	}
 	if ds == DataStructureList {
-		for bucketId := range tx.db.Index.List.Idx {
-			bucket, err := tx.db.bucketMgr.GetBucketById(uint64(bucketId))
-			if err != nil {
-				return err
-			}
-			if end, err := utils.MatchForRange(pattern, bucket.Name, f); end || err != nil {
-				return err
-			}
-		}
+		bucketIds = sortedBucketIds(tx.db.Index.List.Idx)
 	}
 	if ds == DataStructureBTree {
-		for bucketId := range tx.db.Index.BTree.Idx {
-			bucket, err := tx.db.bucketMgr.GetBucketById(uint64(bucketId))
-			if err != nil {
-				return err
+		bucketIds = sortedBucketIds(tx.db.Index.BTree.Idx)
+	}
+
+	for _, bucketId := range bucketIds {
+		bucket, err := tx.db.bucketMgr.GetBucketById(uint64(bucketId))
+		if err != nil {
+			// A missing metadata only affects this single bucket (e.g. it was
+			// deleted but its id is still left in the index): record it and
+			// skip, instead of aborting the whole iteration.
+			if errors.Is(err, ErrBucketNotExist) {
+				utils.GetLogger().Printf("IterateBuckets: skip bucket id %d of ds %d, metadata not found: %v", bucketId, ds, err)
+				continue
 			}
-			if end, err := utils.MatchForRange(pattern, bucket.Name, f); end || err != nil {
-				return err
-			}
+			// Any other error is fatal for the whole iteration.
+			return err
+		}
+		if end, err := utils.MatchForRange(pattern, bucket.Name, f); end || err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// sortedBucketIds returns the bucket ids of the index in ascending order, so
+// the iteration order stays stable and is not affected by deleted buckets.
+func sortedBucketIds[T IndexType](idx map[core.BucketId]*T) []core.BucketId {
+	bucketIds := make([]core.BucketId, 0, len(idx))
+	for bucketId := range idx {
+		bucketIds = append(bucketIds, bucketId)
+	}
+	sort.Slice(bucketIds, func(i, j int) bool { return bucketIds[i] < bucketIds[j] })
+	return bucketIds
 }
 
 func (tx *Tx) NewKVBucket(name string) error {
