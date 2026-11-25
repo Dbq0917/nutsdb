@@ -122,10 +122,21 @@ func (e *Entry) GetCrc(buf []byte) uint32 {
 // ParsePayload means this function will parse a byte array to bucket, key, size of an entry
 func (e *Entry) ParsePayload(data []byte) error {
 	meta := e.Meta
+	if meta == nil {
+		return ErrPayLoadSizeMismatch
+	}
+	keySize := int64(meta.KeySize)
+	valueSize := int64(meta.ValueSize)
+	payloadSize := int64(len(data))
+
+	if keySize < 0 || valueSize < 0 || keySize > payloadSize || valueSize > payloadSize-keySize {
+		return ErrPayLoadSizeMismatch
+	}
+
 	keyLowBound := 0
-	keyHighBound := meta.KeySize
+	keyHighBound := int(keySize)
 	valueLowBound := keyHighBound
-	valueHighBound := meta.KeySize + meta.ValueSize
+	valueHighBound := int(keySize + valueSize)
 
 	// parse key
 	// Copy the key: data also holds the value, and the key outlives this call in
@@ -155,29 +166,63 @@ func (e *Entry) ParseMeta(buf []byte) (int64, error) {
 	}
 
 	e.Meta = NewMetaData()
-
-	e.Meta.WithCrc(binary.LittleEndian.Uint32(buf[0:4]))
-
 	index := 4
 
-	timestamp, n := binary.Uvarint(buf[index:])
-	index += n
-	keySize, n := binary.Uvarint(buf[index:])
-	index += n
-	valueSize, n := binary.Uvarint(buf[index:])
-	index += n
-	flag, n := binary.Uvarint(buf[index:])
-	index += n
-	ttl, n := binary.Uvarint(buf[index:])
-	index += n
-	status, n := binary.Uvarint(buf[index:])
-	index += n
-	ds, n := binary.Uvarint(buf[index:])
-	index += n
-	txId, n := binary.Uvarint(buf[index:])
-	index += n
-	bucketId, n := binary.Uvarint(buf[index:])
-	index += n
+	readUvarint := func() (uint64, error) {
+		if index >= len(buf) {
+			return 0, ErrHeaderSizeOutOfBounds
+		}
+
+		value, n := binary.Uvarint(buf[index:])
+		if n <= 0 {
+			return 0, ErrHeaderSizeOutOfBounds
+		}
+
+		index += n
+		return value, nil
+	}
+
+	e.Meta.WithCrc(binary.LittleEndian.Uint32(buf[0:4]))
+	timestamp, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	keySize, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	valueSize, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	flag, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	ttl, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	status, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	ds, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	txId, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+	bucketId, err := readUvarint()
+	if err != nil {
+		return 0, err
+	}
+
+	if index > len(buf) {
+		return 0, ErrHeaderSizeOutOfBounds
+	}
 
 	e.Meta.
 		WithTimeStamp(timestamp).

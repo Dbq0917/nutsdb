@@ -36,6 +36,10 @@ func newFileRecovery(path string, bufSize int) (fr *fileRecovery, err error) {
 
 // readEntry will read an Entry from disk.
 func (fr *fileRecovery) readEntry(off int64) (e *core.Entry, err error) {
+	if off < 0 || off >= fr.size {
+		return nil, io.EOF
+	}
+
 	var size int64 = core.MaxEntryHeaderSize
 	// Since core.MaxEntryHeaderSize may be larger than the actual Header, it needs to be calculated
 	if off+size > fr.size {
@@ -43,12 +47,7 @@ func (fr *fileRecovery) readEntry(off int64) (e *core.Entry, err error) {
 	}
 
 	buf := make([]byte, size)
-	_, err = fr.fd.Seek(off, 0)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = fr.fd.Read(buf)
+	_, err = fr.fd.ReadAt(buf, off)
 	if err != nil {
 		return nil, err
 	}
@@ -67,6 +66,10 @@ func (fr *fileRecovery) readEntry(off int64) (e *core.Entry, err error) {
 	remainingBuf := buf[headerSize:]
 
 	payloadSize := e.Meta.PayloadSize()
+	if payloadSize < 0 || headerSize > fr.size-off || payloadSize > fr.size-off-headerSize {
+		return nil, io.ErrUnexpectedEOF
+	}
+
 	dataBuf := make([]byte, payloadSize)
 	excessSize := size - headerSize
 
@@ -74,8 +77,7 @@ func (fr *fileRecovery) readEntry(off int64) (e *core.Entry, err error) {
 		copy(dataBuf, remainingBuf[:payloadSize])
 	} else {
 		copy(dataBuf, remainingBuf)
-		_, err := fr.fd.Read(dataBuf[excessSize:])
-		if err != nil {
+		if _, err := fr.fd.ReadAt(dataBuf[excessSize:], off+size); err != nil {
 			return nil, err
 		}
 	}
@@ -91,6 +93,23 @@ func (fr *fileRecovery) readEntry(off int64) (e *core.Entry, err error) {
 	}
 
 	return e, nil
+}
+
+func (fr *fileRecovery) truncate(size int64) error {
+	if fr.closed {
+		return nil
+	}
+	if size < 0 || size > fr.size {
+		return ErrIndexOutOfBound
+	}
+	if err := fr.fd.Truncate(size); err != nil {
+		return err
+	}
+	if err := fr.fd.Sync(); err != nil {
+		return err
+	}
+	fr.size = size
+	return nil
 }
 
 func (fr *fileRecovery) readBucket() (b *core.Bucket, err error) {

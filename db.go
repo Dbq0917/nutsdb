@@ -597,9 +597,19 @@ func (db *DB) parseDataFiles(dataFileIds []int64) (err error) {
 		for {
 			entry, err := f.readEntry(off)
 			if err != nil {
+				boundaryError := isRecoveryBoundaryError(err)
+				tornActiveTail := fID == db.MaxFileID && errors.Is(err, ErrCrc)
+
+				if (boundaryError || tornActiveTail) && off <= f.size {
+					if truncateErr := f.truncate(off); truncateErr != nil {
+						_ = f.release()
+						return fmt.Errorf("truncate incomplete entry at offset %d: %w", off, truncateErr)
+					}
+				}
+
 				// whatever which logic branch it will choose, we will release the fd.
 				_ = f.release()
-				if errors.Is(err, io.EOF) || errors.Is(err, ErrIndexOutOfBound) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrEntryZero) || errors.Is(err, core.ErrHeaderSizeOutOfBounds) {
+				if boundaryError || tornActiveTail {
 					break
 				}
 				if off >= db.opt.SegmentSize {
@@ -681,6 +691,15 @@ func (db *DB) parseDataFiles(dataFileIds []int64) (err error) {
 	// compute the valid record count and save it in db.RecordCount
 	db.RecordCount, err = db.getRecordCount()
 	return
+}
+
+func isRecoveryBoundaryError(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, ErrIndexOutOfBound) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, ErrEntryZero) ||
+		errors.Is(err, core.ErrHeaderSizeOutOfBounds) ||
+		errors.Is(err, core.ErrPayLoadSizeMismatch)
 }
 
 // loadHintFile loads a single hint file and rebuilds indexes

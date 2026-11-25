@@ -16,6 +16,7 @@ package nutsdb
 
 import (
 	"errors"
+	"io"
 
 	"github.com/nutsdb/nutsdb/internal/core"
 	"github.com/nutsdb/nutsdb/internal/fileio"
@@ -57,10 +58,18 @@ func NewDataFile(path string, rwManager fileio.RWManager) *DataFile {
 // ReadEntry returns entry at the given off(offset).
 // payloadSize = bucketSize + keySize + valueSize
 func (df *DataFile) ReadEntry(off int, payloadSize int64) (e *core.Entry, err error) {
+	if off < 0 || payloadSize < 0 {
+		return nil, ErrIndexOutOfBound
+	}
+
 	size := core.MaxEntryHeaderSize + payloadSize
+	fileSize := df.rwManager.Size()
 	// Since core.MaxEntryHeaderSize + payloadSize may be larger than the actual entry size, it needs to be calculated
-	if int64(off)+size > df.rwManager.Size() {
-		size = df.rwManager.Size() - int64(off)
+	if int64(off) >= fileSize {
+		return nil, io.EOF
+	}
+	if int64(off)+size > fileSize {
+		size = fileSize - int64(off)
 	}
 	buf := make([]byte, size)
 
@@ -74,9 +83,6 @@ func (df *DataFile) ReadEntry(off int, payloadSize int64) (e *core.Entry, err er
 		return nil, err
 	}
 
-	// Remove the content after the Header
-	buf = buf[:int(headerSize+payloadSize)]
-
 	if e.IsZero() {
 		return nil, ErrEntryZero
 	}
@@ -84,6 +90,14 @@ func (df *DataFile) ReadEntry(off int, payloadSize int64) (e *core.Entry, err er
 	if err := e.CheckPayloadSize(payloadSize); err != nil {
 		return nil, err
 	}
+
+	requiredSize := headerSize + payloadSize
+	if requiredSize < headerSize || requiredSize > int64(len(buf)) {
+		return nil, io.ErrUnexpectedEOF
+	}
+
+	// Remove the content after the Header
+	buf = buf[:int(requiredSize)]
 
 	err = e.ParsePayload(buf[headerSize:])
 	if err != nil {
